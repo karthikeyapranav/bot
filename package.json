@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
+    "postinstall": "patch-package",
     "android": "react-native run-android",
     "ios": "react-native run-ios",
     "lint": "eslint .",
@@ -10,9 +11,15 @@
     "test": "jest"
   },
   "dependencies": {
+    "@lenml/tokenizers": "^3.7.2",
+    "@op-engineering/op-sqlite": "^16.1.0",
+    "@react-native/new-app-screen": "0.85.3",
+    "axios": "^1.16.1",
+    "llama.rn": "^0.12.3",
+    "onnxruntime-react-native": "^1.24.3",
     "react": "19.2.3",
     "react-native": "0.85.3",
-    "@react-native/new-app-screen": "0.85.3",
+    "react-native-fs": "^2.20.0",
     "react-native-safe-area-context": "^5.5.2"
   },
   "devDependencies": {
@@ -32,6 +39,7 @@
     "@types/react-test-renderer": "^19.1.0",
     "eslint": "^8.19.0",
     "jest": "^29.6.3",
+    "patch-package": "^8.0.1",
     "prettier": "2.8.8",
     "react-test-renderer": "19.2.3",
     "typescript": "^5.8.3"

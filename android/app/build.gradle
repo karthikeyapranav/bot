@@ -84,6 +84,9 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        externalNativeBuild {
+           cmake { arguments "-DOPSQLITE_USE_SQLITEVEC=1" }  // enables sqlite-vec
+        }
     }
     signingConfigs {
         debug {
