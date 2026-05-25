@@ -22,8 +22,11 @@ import ProgressBar from './src/components/ProgressBar';
 
 // ── RAG imports ───────────────────────────────────────────────────────────────
 import {loadEmbeddingModel} from './src/api/embeddingModel';
-import {initVectorDB, clearAllChunks} from './src/api/vectorDb';
-import {ingestText, buildRAGPrompt} from './src/api/rag';
+import {
+  initVectorDB,
+  type RetrievedChunk,
+} from './src/api/vectorDb';
+import {buildRAGPrompt} from './src/api/rag';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -31,6 +34,7 @@ type Message = {
   role: 'system' | 'user' | 'assistant';
   content: string;         // raw content sent to LLM
   displayContent?: string; // what the user sees (original question, not the RAG prompt)
+  ragChunks?: RetrievedChunk[];
 };
 
 type Page = 'modelSelection' | 'conversation' | 'ragSetup';
@@ -80,10 +84,9 @@ function App(): React.JSX.Element {
   const [embeddingReady, setEmbeddingReady] = useState(false);
   const [embeddingLoading, setEmbeddingLoading] = useState(false);
   const [ragEnabled, setRagEnabled] = useState(false);
-  const [docText, setDocText] = useState('');
   const [isIngesting, setIsIngesting] = useState(false);
-  const [ingestProgress, setIngestProgress] = useState({done: 0, total: 0});
   const [chunksLoaded, setChunksLoaded] = useState(false);
+  const [knowledgeChunkCount, setKnowledgeChunkCount] = useState(0);
 
   // ── Navigation ─────────────────────────────────────────────────────────────
   const [currentPage, setCurrentPage] = useState<Page>('modelSelection');
@@ -94,10 +97,13 @@ function App(): React.JSX.Element {
   useEffect(() => {
     const setup = async () => {
       try {
-        initVectorDB();
-        console.log('VectorDB initialised');
+        const chunkCount = await initVectorDB();
+        setKnowledgeChunkCount(chunkCount);
+        setChunksLoaded(chunkCount > 0);
+        setRagEnabled(chunkCount > 0);
+        console.log('Knowledge DB initialised');
       } catch (e) {
-        console.warn('VectorDB init failed:', e);
+        console.warn('Knowledge DB init failed:', e);
       }
 
       setEmbeddingLoading(true);
@@ -227,14 +233,18 @@ function App(): React.JSX.Element {
 
     try {
       let promptContent = userText;
+      let retrievedChunks: RetrievedChunk[] = [];
 
       // If RAG is enabled and chunks are loaded, enrich the prompt
       if (ragEnabled && chunksLoaded && embeddingReady) {
         try {
-          promptContent = await buildRAGPrompt(userText);
+          const ragResult = await buildRAGPrompt(userText);
+          promptContent = ragResult.prompt;
+          retrievedChunks = ragResult.chunks;
         } catch (ragErr) {
           console.warn('RAG prompt failed, using plain question:', ragErr);
           promptContent = userText;
+          retrievedChunks = [];
         }
       }
 
@@ -245,6 +255,7 @@ function App(): React.JSX.Element {
           role: 'user',
           content: promptContent,       // this goes to the LLM
           displayContent: userText,     // this is shown in the chat bubble
+          ragChunks: retrievedChunks,
         },
       ];
       setConversation(newConversation);
@@ -286,45 +297,22 @@ function App(): React.JSX.Element {
 
   // ── RAG helpers ────────────────────────────────────────────────────────────
   const handleIngestDocument = async () => {
-    if (!docText.trim()) {
-      Alert.alert('Empty', 'Please paste some text to ingest.');
-      return;
-    }
     if (!embeddingReady) {
       Alert.alert('Not Ready', 'Embedding model is still loading.');
       return;
     }
     setIsIngesting(true);
-    setIngestProgress({done: 0, total: 0});
     try {
-      clearAllChunks(); // clear previous docs
-      await ingestText(docText.trim(), (done, total) =>
-        setIngestProgress({done, total}),
-      );
-      setChunksLoaded(true);
-      setDocText('');
-      Alert.alert('Done!', 'Document ingested. RAG is now active.');
+      const chunkCount = await initVectorDB();
+      setKnowledgeChunkCount(chunkCount);
+      setChunksLoaded(chunkCount > 0);
+      setRagEnabled(chunkCount > 0);
+      Alert.alert('Done!', `Knowledge DB loaded with ${chunkCount} chunks.`);
     } catch (e) {
-      Alert.alert('Ingest Error', e instanceof Error ? e.message : 'Unknown');
+      Alert.alert('DB Load Error', e instanceof Error ? e.message : 'Unknown');
     } finally {
       setIsIngesting(false);
     }
-  };
-
-  const handleClearRAG = () => {
-    Alert.alert('Clear Document?', 'This removes all indexed chunks.', [
-      {text: 'Cancel', style: 'cancel'},
-      {
-        text: 'Clear',
-        style: 'destructive',
-        onPress: () => {
-          clearAllChunks();
-          setChunksLoaded(false);
-          setRagEnabled(false);
-          Alert.alert('Cleared', 'Vector DB reset.');
-        },
-      },
-    ]);
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -335,7 +323,8 @@ function App(): React.JSX.Element {
     <SafeAreaView style={styles.root}>
       <KeyboardAvoidingView
         style={styles.flex}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={0}>
 
         {/* ── Header ─────────────────────────────────────────────────────── */}
         <View style={styles.header}>
@@ -375,7 +364,9 @@ function App(): React.JSX.Element {
           ) : embeddingReady ? (
             <Text style={styles.statusText}>
               ✓ Embedding ready
-              {chunksLoaded ? '  |  ✓ Doc loaded' : '  |  No doc loaded'}
+              {chunksLoaded
+                ? `  |  ✓ DB loaded (${knowledgeChunkCount} chunks)`
+                : '  |  No DB loaded'}
               {chunksLoaded
                 ? ragEnabled
                   ? '  |  RAG ON'
@@ -485,52 +476,48 @@ function App(): React.JSX.Element {
               </TouchableOpacity>
               {!chunksLoaded && (
                 <Text style={styles.hintText}>
-                  Load a document below to enable RAG.
+                  Load the bundled knowledge DB below to enable RAG.
                 </Text>
               )}
             </View>
 
-            {/* Paste document */}
+            {/* Bundled knowledge DB */}
             <View style={styles.card}>
-              <Text style={styles.sectionLabel}>Paste Document Text</Text>
-              <TextInput
-                style={styles.docInput}
-                placeholder="Paste your document text here…"
-                placeholderTextColor="#94A3B8"
-                multiline
-                numberOfLines={10}
-                value={docText}
-                onChangeText={setDocText}
-                textAlignVertical="top"
-              />
+              <Text style={styles.sectionLabel}>Knowledge Database</Text>
+              <Text style={styles.hintText}>
+                Bundled asset: knowledge.db
+                {knowledgeChunkCount
+                  ? `\nIndexed chunks available: ${knowledgeChunkCount}`
+                  : '\nNo chunks loaded yet.'}
+              </Text>
               {isIngesting ? (
                 <View style={styles.ingestProgress}>
                   <ActivityIndicator size="small" color="#3B82F6" />
                   <Text style={styles.ingestProgressText}>
-                    Embedding chunk {ingestProgress.done} / {ingestProgress.total}…
+                    Loading knowledge DB…
                   </Text>
                 </View>
               ) : (
                 <TouchableOpacity
                   style={[
                     styles.primaryBtn,
-                    (!embeddingReady || !docText.trim()) && styles.primaryBtnDisabled,
+                    !embeddingReady && styles.primaryBtnDisabled,
                   ]}
-                  disabled={!embeddingReady || !docText.trim()}
+                  disabled={!embeddingReady}
                   onPress={handleIngestDocument}>
-                  <Text style={styles.primaryBtnText}>Embed & Index Document</Text>
+                  <Text style={styles.primaryBtnText}>Reload Knowledge DB</Text>
                 </TouchableOpacity>
               )}
             </View>
 
-            {/* Clear */}
+            {/* Refresh */}
             {chunksLoaded && (
               <View style={styles.card}>
                 <Text style={styles.sectionLabel}>Manage Index</Text>
                 <TouchableOpacity
-                  style={styles.dangerBtn}
-                  onPress={handleClearRAG}>
-                  <Text style={styles.dangerBtnText}>🗑 Clear Document Index</Text>
+                  style={styles.primaryBtn}
+                  onPress={handleIngestDocument}>
+                  <Text style={styles.primaryBtnText}>Reload Bundled DB</Text>
                 </TouchableOpacity>
               </View>
             )}
@@ -594,6 +581,28 @@ function App(): React.JSX.Element {
                         : msg.content}
                     </Text>
                   </View>
+                  {msg.role === 'user' && msg.ragChunks?.length ? (
+                    <View style={styles.retrievedPanel}>
+                      <Text style={styles.retrievedTitle}>
+                        Top {msg.ragChunks.length} retrieved chunks
+                      </Text>
+                      {msg.ragChunks.map((chunk, chunkIndex) => (
+                        <View key={`${chunk.id}-${chunkIndex}`} style={styles.chunkCard}>
+                          <Text style={styles.chunkMeta}>
+                            #{chunkIndex + 1} · chunk {chunk.id}
+                            {chunk.page != null ? ` · page ${chunk.page}` : ''}
+                            {Number.isFinite(Number(chunk.distance))
+                              ? ` · distance ${Number(chunk.distance).toFixed(4)}`
+                              : ''}
+                          </Text>
+                          <Text style={styles.chunkText}>{chunk.text}</Text>
+                          {chunk.source ? (
+                            <Text style={styles.chunkSource}>{chunk.source}</Text>
+                          ) : null}
+                        </View>
+                      ))}
+                    </View>
+                  ) : null}
                 </View>
               ))}
 
@@ -922,6 +931,37 @@ const styles = StyleSheet.create({
   },
   bubbleText: {fontSize: 15, color: TEXT_MAIN, lineHeight: 22},
   bubbleTextUser: {color: '#FFFFFF'},
+  retrievedPanel: {
+    width: '92%',
+    marginTop: 8,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: BORDER,
+  },
+  retrievedTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: TEXT_SUB,
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+  },
+  chunkCard: {
+    paddingTop: 8,
+    marginTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: BORDER,
+  },
+  chunkMeta: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: BLUE_DARK,
+    marginBottom: 4,
+  },
+  chunkText: {fontSize: 12, color: TEXT_MAIN, lineHeight: 18},
+  chunkSource: {fontSize: 10, color: TEXT_MUTED, marginTop: 6},
 
   // ── Input bar ─────────────────────────────────────────────────────────────
   inputBar: {

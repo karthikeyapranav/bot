@@ -1,5 +1,9 @@
 import {getEmbedding} from './embeddingModel';
-import {insertChunkWithEmbedding, retrieveTopK} from './vectorDb';
+import {
+  insertChunkWithEmbedding,
+  retrieveTopK,
+  type RetrievedChunk,
+} from './vectorDb';
 
 // Split text into overlapping chunks of ~150 words
 export function chunkText(text: string, chunkSize = 150, overlap = 20): string[] {
@@ -29,21 +33,32 @@ export async function ingestText(
 }
 
 // Build the RAG-enriched prompt to send to the LLM
-export async function buildRAGPrompt(userQuestion: string): Promise<string> {
+export async function buildRAGPrompt(
+  userQuestion: string,
+): Promise<{prompt: string; chunks: RetrievedChunk[]}> {
   const queryEmbed = await getEmbedding(userQuestion);
-  const topChunks = retrieveTopK(queryEmbed, 3);
+  const topChunks = retrieveTopK(queryEmbed, 5);
 
   if (topChunks.length === 0) {
     // No context found — pass question directly
-    return userQuestion;
+    return {prompt: userQuestion, chunks: []};
   }
 
-  const context = topChunks.join('\n\n---\n\n');
-  return (
+  const context = topChunks
+    .map((chunk, index) => {
+      const source = chunk.source ? `Source: ${chunk.source}` : 'Source: unknown';
+      const page = chunk.page != null ? `Page: ${chunk.page}` : 'Page: unknown';
+      return `[Chunk ${index + 1} | ${source} | ${page}]\n${chunk.text}`;
+    })
+    .join('\n\n---\n\n');
+
+  const prompt =
     `Use the following retrieved context to answer the question. ` +
+    `Summarize the relevant facts clearly. ` +
     `If the context does not contain the answer, say so.\n\n` +
     `Context:\n${context}\n\n` +
     `Question: ${userQuestion}\n` +
-    `Answer:`
-  );
+    `Answer:`;
+
+  return {prompt, chunks: topChunks};
 }
