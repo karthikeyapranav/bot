@@ -82,8 +82,8 @@ export function retrieveTopK(queryEmbedding: number[], k = 5): RetrievedChunk[] 
     FROM chunk_vecs v
     JOIN chunks c ON c.id = v.chunk_id
     WHERE v.embedding MATCH ?
+      AND k = ?
     ORDER BY v.distance
-    LIMIT ?
     `,
     [vecStr, k],
   );
