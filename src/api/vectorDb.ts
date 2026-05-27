@@ -50,24 +50,13 @@ export async function initVectorDB() {
   return chunkCount;
 }
 
-export function insertChunkWithEmbedding(content: string, embedding: number[]) {
-  if (!db) throw new Error('DB not initialised');
-
-  const insertChunk = db.executeSync(
-    'INSERT INTO chunks (text) VALUES (?)',
-    [content],
-  );
-  const rowId = insertChunk.insertId!;
-
-  // sqlite-vec expects a JSON array string for the vector
-  const vecStr = JSON.stringify(embedding);
-  db.executeSync(
-    'INSERT INTO chunk_vecs(chunk_id, embedding) VALUES (?, ?);',
-    [rowId, vecStr],
-  );
-}
-
-export function retrieveTopK(queryEmbedding: number[], k = 5): RetrievedChunk[] {
+/**
+ * Retrieve the top-K most similar chunks for a given query embedding.
+ * The DB is treated as READ-ONLY during the app session — nothing is
+ * ever written here at query time.  The knowledge.db was built offline
+ * in Python and ships pre-indexed inside the APK.
+ */
+export function retrieveTopK(queryEmbedding: number[], k = 3): RetrievedChunk[] {
   if (!db) throw new Error('DB not initialised');
 
   const vecStr = JSON.stringify(queryEmbedding);
@@ -96,10 +85,4 @@ export function getChunkCount() {
   const result = db.executeSync('SELECT COUNT(*) AS count FROM chunks');
   const rows = rowsOf<{count: number}>(result);
   return Number(rows[0]?.count ?? 0);
-}
-
-export function clearAllChunks() {
-  if (!db) throw new Error('DB not initialised');
-  db.executeSync('DELETE FROM chunks');
-  db.executeSync('DELETE FROM chunk_vecs');
 }

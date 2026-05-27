@@ -1,64 +1,153 @@
 import {getEmbedding} from './embeddingModel';
-import {
-  insertChunkWithEmbedding,
-  retrieveTopK,
-  type RetrievedChunk,
-} from './vectorDb';
+import {retrieveTopK, type RetrievedChunk} from './vectorDb';
 
-// Split text into overlapping chunks of ~150 words
-export function chunkText(text: string, chunkSize = 150, overlap = 20): string[] {
-  const words = text.split(/\s+/);
-  const chunks: string[] = [];
-  let i = 0;
-  while (i < words.length) {
-    const chunk = words.slice(i, i + chunkSize).join(' ');
-    chunks.push(chunk);
-    i += chunkSize - overlap; // slide forward with overlap
-  }
-  return chunks;
+// ── Constants ─────────────────────────────────────────────────────────────────
+const TOP_K = 3;
+const MAX_CHUNK_WORDS = 150;
+
+// Distance threshold — sqlite-vec returns L2 distance.
+// Empirically, distance > 1.0 means the chunk is probably unrelated.
+// Tune this if your DB uses cosine (lower threshold ~0.3).
+const RELEVANCE_THRESHOLD = 1.0;
+
+// ── Agriculture topic keywords ────────────────────────────────────────────────
+// If the user question contains NONE of these, skip RAG entirely and let
+// the LLM answer from its own knowledge.
+const AGRICULTURE_KEYWORDS = [
+  'crop', 'crops', 'farm', 'farming', 'farmer', 'soil', 'fertilizer',
+  'fertiliser', 'pesticide', 'irrigation', 'harvest', 'seed', 'seeds',
+  'plant', 'plants', 'cultivation', 'cultivate', 'paddy', 'rice', 'wheat',
+  'maize', 'corn', 'sorghum', 'millet', 'pulse', 'lentil', 'chickpea',
+  'vegetable', 'fruit', 'orchard', 'greenhouse', 'compost', 'manure',
+  'weed', 'pest', 'disease', 'blight', 'fungus', 'insect', 'drought',
+  'rainfall', 'season', 'rabi', 'kharif', 'zaid', 'yield', 'acres',
+  'hectare', 'field', 'agriculture', 'agricultural', 'agri', 'horticulture',
+  'floriculture', 'sericulture', 'aquaculture', 'livestock', 'poultry',
+  'cattle', 'dairy', 'goat', 'sheep', 'pH', 'nitrogen', 'phosphorus',
+  'potassium', 'NPK', 'urea', 'spray', 'sowing', 'transplant', 'pruning',
+  'tilling', 'ploughing', 'mulching', 'drip', 'sprinkler',
+];
+
+export type RAGDecision =
+  | 'rag_good'        // question is agri + chunks are relevant
+  | 'rag_weak'        // question is agri + chunks found but distance is high
+  | 'rag_no_chunks'   // question is agri + zero chunks returned
+  | 'skip_not_agri';  // question is NOT agriculture-related → pure LLM
+
+export type RAGPromptResult = {
+  prompt: string;
+  chunks: RetrievedChunk[];
+  decision: RAGDecision;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function truncateChunk(text: string, maxWords = MAX_CHUNK_WORDS): string {
+  const words = text.trim().split(/\s+/);
+  if (words.length <= maxWords) return text.trim();
+  return words.slice(0, maxWords).join(' ') + '…';
 }
 
-// Call this when user loads a document
-export async function ingestText(
-  text: string,
-  onProgress?: (done: number, total: number) => void,
-) {
-  const chunks = chunkText(text);
-  for (let i = 0; i < chunks.length; i++) {
-    const embedding = await getEmbedding(chunks[i]);
-    insertChunkWithEmbedding(chunks[i], embedding);
-    onProgress?.(i + 1, chunks.length);
-  }
-  console.log(`Ingested ${chunks.length} chunks`);
+/**
+ * Checks if the question is agriculture-related by keyword matching.
+ * Simple but fast — no embedding call needed for this check.
+ */
+function isAgricultureQuestion(question: string): boolean {
+  const lower = question.toLowerCase();
+  return AGRICULTURE_KEYWORDS.some(kw => lower.includes(kw));
 }
 
-// Build the RAG-enriched prompt to send to the LLM
+/**
+ * Build the prompt to send to the LLM.
+ *
+ * Decision logic:
+ *
+ *  1. If NOT agriculture → skip RAG, return plain question.
+ *     LLM answers from its own knowledge with no context block.
+ *
+ *  2. If agriculture + chunks retrieved with good distance → RAG prompt.
+ *     LLM uses context to answer.
+ *
+ *  3. If agriculture + chunks retrieved but ALL have high distance (weak) →
+ *     Tell LLM the context is weak, ask it to mention that and supplement
+ *     with its own knowledge.
+ *
+ *  4. If agriculture + zero chunks → plain question, LLM answers itself.
+ */
 export async function buildRAGPrompt(
   userQuestion: string,
-): Promise<{prompt: string; chunks: RetrievedChunk[]}> {
-  const queryEmbed = await getEmbedding(userQuestion);
-  const topChunks = retrieveTopK(queryEmbed, 5);
+): Promise<RAGPromptResult> {
 
-  if (topChunks.length === 0) {
-    // No context found — pass question directly
-    return {prompt: userQuestion, chunks: []};
+  // ── Step 1: Topic check ───────────────────────────────────────────────────
+  if (!isAgricultureQuestion(userQuestion)) {
+    return {
+      prompt: userQuestion,
+      chunks: [],
+      decision: 'skip_not_agri',
+    };
   }
 
-  const context = topChunks
-    .map((chunk, index) => {
-      const source = chunk.source ? `Source: ${chunk.source}` : 'Source: unknown';
-      const page = chunk.page != null ? `Page: ${chunk.page}` : 'Page: unknown';
-      return `[Chunk ${index + 1} | ${source} | ${page}]\n${chunk.text}`;
+  // ── Step 2: Embed + retrieve ──────────────────────────────────────────────
+  const queryEmbed = await getEmbedding(userQuestion);
+  const topChunks = retrieveTopK(queryEmbed, TOP_K);
+
+  if (topChunks.length === 0) {
+    return {
+      prompt: userQuestion,
+      chunks: [],
+      decision: 'rag_no_chunks',
+    };
+  }
+
+  // ── Step 3: Truncate chunks ───────────────────────────────────────────────
+  const truncatedChunks = topChunks.map(chunk => ({
+    ...chunk,
+    text: truncateChunk(chunk.text),
+  }));
+
+  // ── Step 4: Relevance check ───────────────────────────────────────────────
+  const bestDistance = Math.min(...truncatedChunks.map(c => Number(c.distance)));
+  const isWeak = bestDistance > RELEVANCE_THRESHOLD;
+
+  // ── Step 5: Build prompt ──────────────────────────────────────────────────
+  const contextBlock = truncatedChunks
+    .map((chunk, i) => {
+      const src = chunk.source ? `Source: ${chunk.source}` : 'Source: unknown';
+      const pg = chunk.page != null ? ` | Page: ${chunk.page}` : '';
+      const dist = Number.isFinite(Number(chunk.distance))
+        ? ` | dist: ${Number(chunk.distance).toFixed(3)}`
+        : '';
+      return `[Chunk ${i + 1} | ${src}${pg}${dist}]\n${chunk.text}`;
     })
-    .join('\n\n---\n\n');
+    .join('\n\n');
 
-  const prompt =
-    `Use the following retrieved context to answer the question. ` +
-    `Summarize the relevant facts clearly. ` +
-    `If the context does not contain the answer, say so.\n\n` +
-    `Context:\n${context}\n\n` +
-    `Question: ${userQuestion}\n` +
-    `Answer:`;
+  let prompt: string;
 
-  return {prompt, chunks: topChunks};
+  if (isWeak) {
+    // Weak retrieval — tell LLM the context may not be perfect
+    prompt =
+      `You are an agricultural expert. The following passages may be relevant.\n\n` +
+      `${contextBlock}\n\n` +
+      `Answer this question using the passages above AND your own agricultural knowledge. ` +
+      `Do not ask the user for more information. Give a direct answer.\n\n` +
+      `Respond in the same language as the question.\n` +
+      `Question: ${userQuestion}\n` +
+      `Answer:`;
+  } else {
+    // Good retrieval
+    prompt =
+      `You are an agricultural expert. The following passages are from an agriculture document.\n\n` +
+      `${contextBlock}\n\n` +
+      `Using ONLY the passages above, answer this question in 2-3 sentences. ` +
+      `Do not ask for more information. If the passages don't contain the answer, say "I don't have that information in my knowledge base."\n\n` +
+      `Respond in the same language as the question.\n` +
+      `Question: ${userQuestion}\n` +
+      `Answer:`;
+  }
+
+  return {
+    prompt,
+    chunks: truncatedChunks,
+    decision: isWeak ? 'rag_weak' : 'rag_good',
+  };
 }
