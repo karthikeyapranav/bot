@@ -1,5 +1,7 @@
 const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 
+const defaultConfig = getDefaultConfig(__dirname);
+
 /**
  * Metro configuration
  * https://reactnative.dev/docs/metro
@@ -8,8 +10,15 @@ const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
  */
 const config = {
   resolver: {
-    assetExts: ['onnx', 'bin', 'txt', 'json', 'gguf'],
+    assetExts: Array.from(new Set([
+      ...defaultConfig.resolver.assetExts,
+      'onnx',
+      'bin',
+      'txt',
+      'json',
+      'gguf',
+    ])),
   },
 };
 
-module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+module.exports = mergeConfig(defaultConfig, config);

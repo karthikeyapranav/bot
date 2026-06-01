@@ -1,31 +1,28 @@
 import * as ort from 'onnxruntime-react-native';
+import {TokenizerLoader} from '@lenml/tokenizers';
 import RNFS from 'react-native-fs';
 
 let session: ort.InferenceSession | null = null;
-let vocab: Map<string, number> = new Map();
+let tokenizer: any = null;
 
 const MODEL_ASSET = 'model-int8.onnx';
-const VOCAB_ASSET = 'vocab.txt';
+const TOKENIZER_ASSET = 'tokenizer.json';
 const MODEL_DEST = `${RNFS.DocumentDirectoryPath}/model-int8.onnx`;
-const VOCAB_DEST = `${RNFS.DocumentDirectoryPath}/vocab.txt`;
+const TOKENIZER_DEST = `${RNFS.DocumentDirectoryPath}/tokenizer.json`;
 
-// ── Copy from assets to filesystem on first run ──────────────────────────────
-async function copyAssetIfNeeded(asset: string, dest: string) {
+// ── Copy from assets to filesystem so app storage matches bundled assets ─────
+async function copyAsset(asset: string, dest: string) {
   const exists = await RNFS.exists(dest);
-  if (!exists) {
-    await RNFS.copyFileAssets(asset, dest);
-    console.log(`Copied ${asset} → ${dest}`);
-  }
+  if (exists) await RNFS.unlink(dest);
+  await RNFS.copyFileAssets(asset, dest);
+  console.log(`Copied ${asset} → ${dest}`);
 }
 
-// ── Tiny WordPiece tokenizer (no dependency needed for BERT vocab) ───────────
-async function loadVocab() {
-  const raw = await RNFS.readFile(VOCAB_DEST, 'utf8');
-  const lines = raw.split('\n');
-  vocab = new Map();
-  lines.forEach((token, idx) => {
-    const t = token.trim();
-    if (t) vocab.set(t, idx);
+async function loadTokenizer() {
+  const raw = await RNFS.readFile(TOKENIZER_DEST, 'utf8');
+  tokenizer = TokenizerLoader.fromPreTrained({
+    tokenizerJSON: JSON.parse(raw),
+    tokenizerConfig: {},
   });
 }
 
@@ -34,57 +31,13 @@ function tokenize(text: string, maxLen = 128): {
   attention_mask: number[];
   token_type_ids: number[];
 } {
-  // Basic BERT WordPiece tokenize (handles ##subwords)
-  const CLS = vocab.get('[CLS]') ?? 101;
-  const SEP = vocab.get('[SEP]') ?? 102;
-  const UNK = vocab.get('[UNK]') ?? 100;
+  if (!tokenizer) throw new Error('Tokenizer not loaded.');
+
+  const tokens = tokenizer
+    .encode(text, {add_special_tokens: true})
+    .slice(0, maxLen);
   const PAD = 0;
-
-  const words = text.toLowerCase().trim().split(/\s+/);
-  const tokens: number[] = [CLS];
-
-  for (const word of words) {
-    if (tokens.length >= maxLen - 1) break;
-
-    // Try full word first
-    if (vocab.has(word)) {
-      tokens.push(vocab.get(word)!);
-      continue;
-    }
-
-    // WordPiece: greedily split into subwords
-    let remaining = word;
-    let isFirst = true;
-    let wordTokens: number[] = [];
-    let failed = false;
-
-    while (remaining.length > 0) {
-      let found = false;
-      for (let end = remaining.length; end > 0; end--) {
-        const sub = isFirst ? remaining.slice(0, end) : '##' + remaining.slice(0, end);
-        if (vocab.has(sub)) {
-          wordTokens.push(vocab.get(sub)!);
-          remaining = remaining.slice(end);
-          isFirst = false;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        wordTokens = [UNK];
-        failed = true;
-        break;
-      }
-    }
-    tokens.push(...wordTokens);
-    if (failed) continue;
-  }
-
-  tokens.push(SEP);
-
-  // Pad to maxLen
-  const paddedLen = Math.min(tokens.length, maxLen);
-  const input_ids = tokens.slice(0, paddedLen);
+  const input_ids = tokens.slice(0, maxLen);
   const attention_mask = input_ids.map(() => 1);
   const token_type_ids = input_ids.map(() => 0);
 
@@ -128,9 +81,9 @@ function meanPool(
 // ── Public API ────────────────────────────────────────────────────────────────
 export async function loadEmbeddingModel() {
   console.log('Loading embedding model...');
-  await copyAssetIfNeeded(MODEL_ASSET, MODEL_DEST);
-  await copyAssetIfNeeded(VOCAB_ASSET, VOCAB_DEST);
-  await loadVocab();
+  await copyAsset(MODEL_ASSET, MODEL_DEST);
+  await copyAsset(TOKENIZER_ASSET, TOKENIZER_DEST);
+  await loadTokenizer();
 
   session = await ort.InferenceSession.create(MODEL_DEST, {
     executionProviders: ['cpu'],
@@ -167,7 +120,7 @@ export async function getEmbedding(text: string): Promise<number[]> {
   const output = await session.run(feeds);
 
   // Output is last_hidden_state: [1, seqLen, 384]
-  const hiddenState = output['last_hidden_state'].data as Float32Array;
+  const hiddenState = output.last_hidden_state.data as Float32Array;
   const hiddenSize = 384;
 
   return meanPool(hiddenState, attention_mask, maxLen, hiddenSize);

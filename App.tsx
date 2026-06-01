@@ -3,7 +3,6 @@ import {
   StyleSheet,
   View,
   Alert,
-  SafeAreaView,
   ScrollView,
   Text,
   TouchableOpacity,
@@ -12,90 +11,113 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from 'react-native';
+import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
 
-import axios from 'axios';
 import RNFS from 'react-native-fs';
 import {initLlama, releaseAllLlama} from 'llama.rn';
 
-import {downloadModel} from './src/api/model';
+import {downloadModel, isModelDownloaded, GEMMA_MODEL} from './src/api/model';
 import ProgressBar from './src/components/ProgressBar';
 
-// ── RAG imports ───────────────────────────────────────────────────────────────
 import {loadEmbeddingModel} from './src/api/embeddingModel';
-import {initVectorDB, clearAllChunks} from './src/api/vectorDb';
-import {ingestText, buildRAGPrompt} from './src/api/rag';
+import {initVectorDB, type RetrievedChunk} from './src/api/vectorDb';
+import {buildRAGPrompt, type RAGDecision, type LLMCompletionFn} from './src/api/rag';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────────────────────
 
-type Message = {
-  role: 'system' | 'user' | 'assistant';
-  content: string;         // raw content sent to LLM
-  displayContent?: string; // what the user sees (original question, not the RAG prompt)
+type ChatTurn = {
+  userDisplay: string;
+  userPrompt: string;
+  assistantReply: string;
+  ragChunks: RetrievedChunk[];
+  ragDecision: RAGDecision | null;
 };
 
-type Page = 'modelSelection' | 'conversation' | 'ragSetup';
+type Page = 'home' | 'conversation' | 'ragSetup';
 
-const SYSTEM_MESSAGE: Message = {
-  role: 'system',
-  content:
-    'You are a helpful assistant. When context is provided, use it to answer accurately. If the context does not contain the answer, say so honestly.',
-};
+// ─────────────────────────────────────────────────────────────────────────────
+// System prompt — Gemma uses <start_of_turn> / <end_of_turn> tags.
+// We hardcode Telugu as the output language.
+// ─────────────────────────────────────────────────────────────────────────────
 
-const HF_TO_GGUF: Record<string, string> = {
-  'Llama-3.2-1B-Instruct': 'medmekk/Llama-3.2-1B-Instruct.GGUF',
-  'DeepSeek-R1-Distill-Qwen-1.5B': 'medmekk/DeepSeek-R1-Distill-Qwen-1.5B.GGUF',
-  'Qwen2-0.5B-Instruct': 'medmekk/Qwen2.5-0.5B-Instruct.GGUF',
-  'SmolLM2-1.7B-Instruct': 'medmekk/SmolLM2-1.7B-Instruct.GGUF',
-};
+const SYSTEM_CONTENT =
+  'మీరు తెలుగు వ్యవసాయ AI సహాయకుడు. ' +
+  'మీకు వ్యవసాయం, పంటలు, నేల, ఎరువులు, తెగుళ్ళు, నీటిపారుదల మరియు ' +
+  'సంబంధిత అంశాలపై నిపుణత ఉంది. ' +
+  'ముఖ్యమైనది: ఎల్లప్పుడూ తెలుగు భాషలో మాత్రమే సమాధానం ఇవ్వాలి. ' +
+  'ఇంగ్లీష్ లేదా ఇతర భాషలు ఉపయోగించకూడదు. ' +
+  'సందర్భం అందించబడినప్పుడు దానిని ఉపయోగించి సమాధానం ఇవ్వండి. ' +
+  'సందర్భం లేనప్పుడు మీ స్వంత జ్ఞానం నుండి సమాధానం ఇవ్వండి. ' +
+  'సమాధానాలు సంక్షిప్తంగా (200 పదాల కంటే తక్కువ) ఉండాలి.';
 
-const MODEL_FORMATS = Object.keys(HF_TO_GGUF);
+// Classifier system prompt (English only — for YES/NO answer)
+const CLASSIFIER_SYSTEM =
+  'You are a strict binary topic classifier. ' +
+  'Reply with exactly one word: YES or NO. Nothing else.';
 
 const STOP_WORDS = [
+  '<end_of_turn>',
+  '<eos>',
+  '<|end_of_turn|>',
   '</s>',
-  '<|end|>',
-  'user:',
-  'assistant:',
-  '<|im_end|>',
-  '<|eot_id|>',
-  '<|end▁of▁sentence|>',
-  '<｜end▁of▁sentence｜>',
+  '<|endoftext|>',
 ];
+
+// For the fast classifier we use fewer tokens
+const CLASSIFIER_STOP_WORDS = [...STOP_WORDS, '\n', '.', ','];
+
+const MAX_TURNS_IN_CONTEXT = 2;
+
+const DECISION_META: Record<
+  RAGDecision,
+  {label: string; color: string; bg: string}
+> = {
+  rag_good:      {label: '📄 RAG — మంచి సరిపోలిక',       color: '#166534', bg: '#DCFCE7'},
+  rag_weak:      {label: '⚠️ RAG — బలహీన సరిపోలిక',       color: '#92400E', bg: '#FEF3C7'},
+  rag_no_chunks: {label: '🔍 వ్యవసాయ ప్రశ్న — chunks లేవు', color: '#1E3A5F', bg: '#DBEAFE'},
+  skip_not_agri: {label: '💬 సాధారణ — LLM మాత్రమే',        color: '#4B1D96', bg: '#EDE9FE'},
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 function App(): React.JSX.Element {
-  // ── LLM state ──────────────────────────────────────────────────────────────
-  const [conversation, setConversation] = useState<Message[]>([SYSTEM_MESSAGE]);
-  const [selectedModelFormat, setSelectedModelFormat] = useState('');
-  const [selectedGGUF, setSelectedGGUF] = useState<string | null>(null);
-  const [availableGGUFs, setAvailableGGUFs] = useState<string[]>([]);
-  const [userInput, setUserInput] = useState('');
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const [llmContext, setLlmContext] = useState<any>(null);
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [isFetching, setIsFetching] = useState(false);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [llmContext, setLlmContext]               = useState<any>(null);
+  const [downloadProgress, setDownloadProgress]   = useState(0);
+  const [isDownloading, setIsDownloading]         = useState(false);
+  const [modelReady, setModelReady]               = useState(false);
 
-  // ── RAG state ──────────────────────────────────────────────────────────────
-  const [embeddingReady, setEmbeddingReady] = useState(false);
-  const [embeddingLoading, setEmbeddingLoading] = useState(false);
-  const [ragEnabled, setRagEnabled] = useState(false);
-  const [docText, setDocText] = useState('');
-  const [isIngesting, setIsIngesting] = useState(false);
-  const [ingestProgress, setIngestProgress] = useState({done: 0, total: 0});
-  const [chunksLoaded, setChunksLoaded] = useState(false);
+  const [turns, setTurns]                         = useState<ChatTurn[]>([]);
+  const [streamingText, setStreamingText]         = useState('');
+  const [isGenerating, setIsGenerating]           = useState(false);
+  const [userInput, setUserInput]                 = useState('');
 
-  // ── Navigation ─────────────────────────────────────────────────────────────
-  const [currentPage, setCurrentPage] = useState<Page>('modelSelection');
+  const [embeddingReady, setEmbeddingReady]       = useState(false);
+  const [embeddingLoading, setEmbeddingLoading]   = useState(false);
+  const [ragEnabled, setRagEnabled]               = useState(false);
+  const [chunksLoaded, setChunksLoaded]           = useState(false);
+  const [knowledgeChunkCount, setKnowledgeChunkCount] = useState(0);
+  const [isIngesting, setIsIngesting]             = useState(false);
+
+  // Shows "classifying…" spinner while LLM decides agri vs non-agri
+  const [isClassifying, setIsClassifying]         = useState(false);
+
+  const [currentPage, setCurrentPage]             = useState<Page>('home');
 
   const scrollRef = useRef<ScrollView>(null);
 
-  // ── On mount: init vector DB + load embedding model ───────────────────────
+  // ── Mount ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     const setup = async () => {
+      const already = await isModelDownloaded();
+      if (already) await loadLLM(false);
+
       try {
-        initVectorDB();
-        console.log('VectorDB initialised');
+        const count = await initVectorDB();
+        setKnowledgeChunkCount(count);
+        setChunksLoaded(count > 0);
+        setRagEnabled(count > 0);
       } catch (e) {
         console.warn('VectorDB init failed:', e);
       }
@@ -104,119 +126,161 @@ function App(): React.JSX.Element {
       try {
         await loadEmbeddingModel();
         setEmbeddingReady(true);
-        console.log('Embedding model ready');
       } catch (e) {
-        console.warn('Embedding model load failed:', e);
+        console.warn('Embedding model failed:', e);
         Alert.alert(
           'Embedding Warning',
-          'Could not load embedding model. RAG will be disabled.\n\n' +
-            'Make sure model-int8.onnx and vocab.txt are in android/app/src/main/assets/',
+          'Could not load embedding model. RAG will be disabled.',
         );
       } finally {
         setEmbeddingLoading(false);
       }
     };
     setup();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Auto-scroll when new messages arrive
   useEffect(() => {
     setTimeout(() => scrollRef.current?.scrollToEnd({animated: true}), 100);
-  }, [conversation]);
+  }, [turns, streamingText]);
 
-  // ── LLM helpers ────────────────────────────────────────────────────────────
-  const handleFormatSelection = (format: string) => {
-    setSelectedModelFormat(format);
-    setAvailableGGUFs([]);
-    fetchAvailableGGUFs(format);
-  };
-
-  const fetchAvailableGGUFs = async (modelFormat: string) => {
-    setIsFetching(true);
+  // ── Load LLM ───────────────────────────────────────────────────────────────
+  const loadLLM = async (showAlert = true): Promise<boolean> => {
     try {
-      const repoPath = HF_TO_GGUF[modelFormat];
-      if (!repoPath) throw new Error(`No repo mapping for: ${modelFormat}`);
-      const response = await axios.get(
-        `https://huggingface.co/api/models/${repoPath}`,
-      );
-      if (!response.data?.siblings) throw new Error('Invalid API response');
-      const files = response.data.siblings
-        .filter((f: {rfilename: string}) => f.rfilename.endsWith('.gguf'))
-        .map((f: {rfilename: string}) => f.rfilename);
-      setAvailableGGUFs(files);
+      const destPath = `${RNFS.DocumentDirectoryPath}/${GEMMA_MODEL.name}`;
+      const exists = await RNFS.exists(destPath);
+      if (!exists) {
+        Alert.alert('Error', 'Model file not found. Please download it first.');
+        return false;
+      }
+
+      const stat = await RNFS.stat(destPath);
+      if (stat.size < 10_000_000) {
+        await RNFS.unlink(destPath);
+        Alert.alert(
+          'Corrupt Model File',
+          'The saved model file is too small and is likely corrupt.\n\n' +
+            'The file has been deleted. Please download again.',
+        );
+        setModelReady(false);
+        return false;
+      }
+
+      if (llmContext) {
+        await releaseAllLlama();
+        setLlmContext(null);
+        setTurns([]);
+      }
+
+      const ctx = await initLlama({
+        model: destPath,
+        use_mlock: true,
+        n_ctx: 2048,
+        n_gpu_layers: 0,
+        n_batch: 512,
+        n_threads: 4,
+      });
+
+      setLlmContext(ctx);
+      setModelReady(true);
+      if (showAlert) Alert.alert('సిద్ధం!', `${GEMMA_MODEL.displayName} లోడ్ అయింది!`);
+      return true;
     } catch (error) {
-      Alert.alert('Error', error instanceof Error ? error.message : 'Fetch failed');
-      setAvailableGGUFs([]);
-    } finally {
-      setIsFetching(false);
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('LLM load error:', msg);
+      Alert.alert('Load Error', `Could not load model.\n\n${msg}`);
+      return false;
     }
   };
 
-  const handleGGUFSelection = (file: string) => {
-    setSelectedGGUF(file);
-    Alert.alert(
-      'Confirm Download',
-      `Download ${file}?`,
-      [
-        {text: 'No', onPress: () => setSelectedGGUF(null), style: 'cancel'},
-        {text: 'Yes', onPress: () => handleDownloadAndLoad(file)},
-      ],
-      {cancelable: false},
-    );
-  };
-
-  const handleDownloadAndLoad = async (file: string) => {
-    const downloadUrl = `https://huggingface.co/${HF_TO_GGUF[selectedModelFormat]}/resolve/main/${file}`;
+  // ── Download ───────────────────────────────────────────────────────────────
+  const handleDownload = async () => {
     setIsDownloading(true);
     setDownloadProgress(0);
     try {
-      const destPath = await downloadModel(file, downloadUrl, p =>
+      await downloadModel(GEMMA_MODEL.name, GEMMA_MODEL.url, p =>
         setDownloadProgress(p),
       );
-      Alert.alert('Downloaded', `Saved to: ${destPath}`);
-      if (destPath) {
-        const loaded = await loadLLM(file);
-        if (loaded) setCurrentPage('conversation');
-      }
+      const loaded = await loadLLM(true);
+      if (loaded) setCurrentPage('conversation');
     } catch (error) {
-      Alert.alert('Download Error', error instanceof Error ? error.message : 'Unknown error');
+      Alert.alert(
+        'Download Error',
+        error instanceof Error ? error.message : 'Unknown error',
+      );
     } finally {
       setIsDownloading(false);
     }
   };
 
-  const loadLLM = async (modelName: string): Promise<boolean> => {
-    try {
-      const destPath = `${RNFS.DocumentDirectoryPath}/${modelName}`;
-      const exists = await RNFS.exists(destPath);
-      if (!exists) {
-        Alert.alert('Error', 'Model file not found.');
-        return false;
-      }
-      if (llmContext) {
-        await releaseAllLlama();
-        setLlmContext(null);
-        setConversation([SYSTEM_MESSAGE]);
-      }
-      const ctx = await initLlama({
-        model: destPath,
-        use_mlock: true,
-        n_ctx: 2048,
-        n_gpu_layers: 1,
-      });
-      setLlmContext(ctx);
-      Alert.alert('Model Loaded', 'LLM is ready to chat!');
-      return true;
-    } catch (error) {
-      Alert.alert('Load Error', error instanceof Error ? error.message : 'Unknown');
-      return false;
-    }
+  // ── Delete model ───────────────────────────────────────────────────────────
+  const handleDeleteModel = async () => {
+    Alert.alert('Delete Model', 'Delete the downloaded model file?', [
+      {text: 'Cancel', style: 'cancel'},
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            if (llmContext) {
+              await releaseAllLlama();
+              setLlmContext(null);
+              setModelReady(false);
+              setTurns([]);
+            }
+            const destPath = `${RNFS.DocumentDirectoryPath}/${GEMMA_MODEL.name}`;
+            if (await RNFS.exists(destPath)) await RNFS.unlink(destPath);
+            Alert.alert('Deleted', 'Model removed. Download again to use.');
+          } catch (e) {
+            Alert.alert('Error', e instanceof Error ? e.message : 'Unknown');
+          }
+        },
+      },
+    ]);
   };
 
-  // ── Send message (with optional RAG) ──────────────────────────────────────
+  // ── LLMCompletionFn ────────────────────────────────────────────────────────
+  // This thin wrapper is passed into buildRAGPrompt so rag.ts can call the
+  // LLM for classification without depending on llama.rn directly.
+  const makeLLMCompleteFn = (ctx: any): LLMCompletionFn =>
+    async (messages) => {
+      let reply = '';
+      await ctx.completion(
+        {
+          messages,
+          n_predict: 8,           // classifier only needs YES / NO (a bit of room)
+          stop: CLASSIFIER_STOP_WORDS,
+          temperature: 0.0,       // deterministic
+          top_p: 1.0,
+          repeat_penalty: 1.0,
+        },
+        (data: {token: string}) => {
+          reply += data.token;
+        },
+      );
+      return reply.trim();
+    };
+
+  // ── Build sliding-window messages (Gemma chat format) ─────────────────────
+  const buildLLMMessages = (
+    allTurns: ChatTurn[],
+    pendingPrompt: string,
+  ) => {
+    const windowTurns = allTurns.slice(-MAX_TURNS_IN_CONTEXT);
+    const messages: {role: 'system' | 'user' | 'assistant'; content: string}[] =
+      [{role: 'system', content: SYSTEM_CONTENT}];
+    for (const t of windowTurns) {
+      messages.push({role: 'user',      content: t.userPrompt});
+      messages.push({role: 'assistant', content: t.assistantReply});
+    }
+    messages.push({role: 'user', content: pendingPrompt});
+    return messages;
+  };
+
+  // ── Send message ───────────────────────────────────────────────────────────
   const handleSendMessage = async () => {
     if (!llmContext) {
-      Alert.alert('No Model', 'Please download and load a model first.');
+      Alert.alert('No Model', 'Please download the model first.');
       return;
     }
     if (!userInput.trim()) return;
@@ -224,478 +288,496 @@ function App(): React.JSX.Element {
     const userText = userInput.trim();
     setUserInput('');
     setIsGenerating(true);
+    setStreamingText('');
 
     try {
       let promptContent = userText;
+      let retrievedChunks: RetrievedChunk[] = [];
+      let decision: RAGDecision | null = null;
 
-      // If RAG is enabled and chunks are loaded, enrich the prompt
       if (ragEnabled && chunksLoaded && embeddingReady) {
         try {
-          promptContent = await buildRAGPrompt(userText);
+          // Show "classifying" indicator while LLM decides agri vs non-agri
+          setIsClassifying(true);
+          const llmCompleteFn = makeLLMCompleteFn(llmContext);
+          const ragResult = await buildRAGPrompt(userText, llmCompleteFn);
+          setIsClassifying(false);
+
+          promptContent   = ragResult.prompt;
+          retrievedChunks = ragResult.chunks;
+          decision        = ragResult.decision;
         } catch (ragErr) {
-          console.warn('RAG prompt failed, using plain question:', ragErr);
-          promptContent = userText;
+          setIsClassifying(false);
+          console.warn('RAG failed, falling back to plain question:', ragErr);
         }
       }
 
-      // Add the user turn — show original text to user, send enriched prompt to LLM
-      const newConversation: Message[] = [
-        ...conversation,
-        {
-          role: 'user',
-          content: promptContent,       // this goes to the LLM
-          displayContent: userText,     // this is shown in the chat bubble
-        },
-      ];
-      setConversation(newConversation);
+      const llmMessages = buildLLMMessages(turns, promptContent);
 
-      // Build the messages array for the LLM (use content, not displayContent)
-      const llmMessages = newConversation.map(m => ({
-        role: m.role,
-        content: m.content,
-      }));
-
+      let fullReply = '';
       const result = await llmContext.completion(
         {
           messages: llmMessages,
-          n_predict: 1024,
+          n_predict: 400,
           stop: STOP_WORDS,
+          temperature: 0.7,
+          top_p: 0.9,
+          repeat_penalty: 1.1,
         },
-        (_data: {token: string}) => {
-          // partial token callback — could stream here
+        (data: {token: string}) => {
+          fullReply += data.token;
+          setStreamingText(fullReply);
         },
       );
 
-      if (result?.text) {
-        setConversation(prev => [
-          ...prev,
-          {role: 'assistant', content: result.text.trim()},
-        ]);
-      } else {
-        throw new Error('Empty response from model.');
-      }
+      const finalReply = ((result?.text ?? '') || fullReply).trim();
+      if (!finalReply) throw new Error('Empty response from model.');
+
+      setTurns(prev => [
+        ...prev,
+        {
+          userDisplay:    userText,
+          userPrompt:     promptContent,
+          assistantReply: finalReply,
+          ragChunks:      retrievedChunks,
+          ragDecision:    decision,
+        },
+      ]);
+      setStreamingText('');
     } catch (error) {
-      Alert.alert(
-        'Inference Error',
-        error instanceof Error ? error.message : 'Unknown error.',
-      );
+      const msg = error instanceof Error ? error.message : 'Unknown error.';
+      Alert.alert('Inference Error', msg);
+      setStreamingText('');
+      setIsClassifying(false);
     } finally {
       setIsGenerating(false);
     }
   };
 
-  // ── RAG helpers ────────────────────────────────────────────────────────────
-  const handleIngestDocument = async () => {
-    if (!docText.trim()) {
-      Alert.alert('Empty', 'Please paste some text to ingest.');
-      return;
-    }
+  // ── Reload knowledge DB ────────────────────────────────────────────────────
+  const handleReloadDB = async () => {
     if (!embeddingReady) {
       Alert.alert('Not Ready', 'Embedding model is still loading.');
       return;
     }
     setIsIngesting(true);
-    setIngestProgress({done: 0, total: 0});
     try {
-      clearAllChunks(); // clear previous docs
-      await ingestText(docText.trim(), (done, total) =>
-        setIngestProgress({done, total}),
-      );
-      setChunksLoaded(true);
-      setDocText('');
-      Alert.alert('Done!', 'Document ingested. RAG is now active.');
+      const count = await initVectorDB();
+      setKnowledgeChunkCount(count);
+      setChunksLoaded(count > 0);
+      setRagEnabled(count > 0);
+      Alert.alert('Done', `Knowledge DB loaded with ${count} chunks.`);
     } catch (e) {
-      Alert.alert('Ingest Error', e instanceof Error ? e.message : 'Unknown');
+      Alert.alert('DB Error', e instanceof Error ? e.message : 'Unknown');
     } finally {
       setIsIngesting(false);
     }
   };
 
-  const handleClearRAG = () => {
-    Alert.alert('Clear Document?', 'This removes all indexed chunks.', [
-      {text: 'Cancel', style: 'cancel'},
-      {
-        text: 'Clear',
-        style: 'destructive',
-        onPress: () => {
-          clearAllChunks();
-          setChunksLoaded(false);
-          setRagEnabled(false);
-          Alert.alert('Cleared', 'Vector DB reset.');
-        },
-      },
-    ]);
-  };
+  const turnsInWindow = Math.min(turns.length, MAX_TURNS_IN_CONTEXT);
+  const turnsDropped  = Math.max(0, turns.length - MAX_TURNS_IN_CONTEXT);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // RENDER
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={styles.root}>
-      <KeyboardAvoidingView
-        style={styles.flex}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.root}>
+        <KeyboardAvoidingView
+          style={styles.flex}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          keyboardVerticalOffset={0}>
 
-        {/* ── Header ─────────────────────────────────────────────────────── */}
-        <View style={styles.header}>
-          <Text style={styles.headerTitle}>🦙 LlamaRAG</Text>
-          <View style={styles.headerRight}>
-            {/* RAG setup button — only show when a model is loaded */}
-            {currentPage === 'conversation' && (
-              <TouchableOpacity
-                style={styles.headerBtn}
-                onPress={() => setCurrentPage('ragSetup')}>
-                <Text style={styles.headerBtnText}>
-                  📄 {chunksLoaded ? 'Doc ✓' : 'Doc'}
-                </Text>
-              </TouchableOpacity>
-            )}
-            {currentPage === 'ragSetup' && (
-              <TouchableOpacity
-                style={styles.headerBtn}
-                onPress={() => setCurrentPage('conversation')}>
-                <Text style={styles.headerBtnText}>← Chat</Text>
-              </TouchableOpacity>
-            )}
+          {/* ── Header ──────────────────────────────────────────────────── */}
+          <View style={styles.header}>
+            <Text style={styles.headerTitle}>🌾 AgriRAG తెలుగు</Text>
+            <View style={styles.headerRight}>
+              {currentPage === 'conversation' && (
+                <TouchableOpacity
+                  style={styles.headerBtn}
+                  onPress={() => setCurrentPage('ragSetup')}>
+                  <Text style={styles.headerBtnText}>
+                    📄 {chunksLoaded ? 'Doc ✓' : 'Doc'}
+                  </Text>
+                </TouchableOpacity>
+              )}
+              {currentPage === 'ragSetup' && (
+                <TouchableOpacity
+                  style={styles.headerBtn}
+                  onPress={() => setCurrentPage('conversation')}>
+                  <Text style={styles.headerBtnText}>← Chat</Text>
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
-        </View>
 
-        {/* ── Embedding status bar ────────────────────────────────────────── */}
-        <View
-          style={[
+          {/* ── Embedding status bar ─────────────────────────────────────── */}
+          <View style={[
             styles.statusBar,
             embeddingReady ? styles.statusReady : styles.statusLoading,
           ]}>
-          {embeddingLoading ? (
-            <>
-              <ActivityIndicator size="small" color="#fff" style={{marginRight: 8}} />
-              <Text style={styles.statusText}>Loading embedding model…</Text>
-            </>
-          ) : embeddingReady ? (
-            <Text style={styles.statusText}>
-              ✓ Embedding ready
-              {chunksLoaded ? '  |  ✓ Doc loaded' : '  |  No doc loaded'}
-              {chunksLoaded
-                ? ragEnabled
-                  ? '  |  RAG ON'
-                  : '  |  RAG OFF'
-                : ''}
-            </Text>
-          ) : (
-            <Text style={styles.statusText}>⚠ Embedding model failed to load</Text>
-          )}
-        </View>
+            {embeddingLoading ? (
+              <>
+                <ActivityIndicator size="small" color="#fff" style={{marginRight: 8}} />
+                <Text style={styles.statusText}>Embedding model లోడ్ అవుతోంది…</Text>
+              </>
+            ) : embeddingReady ? (
+              <Text style={styles.statusText}>
+                ✓ Embedding సిద్ధం
+                {chunksLoaded ? `  |  ✓ ${knowledgeChunkCount} chunks` : '  |  DB లేదు'}
+                {chunksLoaded ? (ragEnabled ? '  |  RAG ON' : '  |  RAG OFF') : ''}
+              </Text>
+            ) : (
+              <Text style={styles.statusText}>⚠ Embedding విఫలమైంది</Text>
+            )}
+          </View>
 
-        {/* ═══════════════════════════════════════════════════════════════════
-            PAGE: MODEL SELECTION
-        ═══════════════════════════════════════════════════════════════════ */}
-        {currentPage === 'modelSelection' && !isDownloading && (
-          <ScrollView contentContainerStyle={styles.scrollContent}>
-            <Text style={styles.pageTitle}>Choose a Model</Text>
+          {/* ══════════════════ PAGE: HOME ══════════════════ */}
+          {currentPage === 'home' && !isDownloading && (
+            <ScrollView contentContainerStyle={styles.scrollContent}>
+              <Text style={styles.pageTitle}>ప్రారంభించండి</Text>
 
-            <View style={styles.card}>
-              <Text style={styles.sectionLabel}>Model Format</Text>
-              {MODEL_FORMATS.map(format => (
-                <TouchableOpacity
-                  key={format}
-                  style={[
-                    styles.optionBtn,
-                    selectedModelFormat === format && styles.optionBtnSelected,
-                  ]}
-                  onPress={() => handleFormatSelection(format)}>
-                  <Text
-                    style={[
-                      styles.optionBtnText,
-                      selectedModelFormat === format && styles.optionBtnTextSelected,
-                    ]}>
-                    {format}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            {selectedModelFormat !== '' && (
               <View style={styles.card}>
-                <Text style={styles.sectionLabel}>Select GGUF Quantisation</Text>
-                {isFetching && (
-                  <ActivityIndicator
-                    size="small"
-                    color="#3B82F6"
-                    style={{marginVertical: 12}}
-                  />
-                )}
-                {availableGGUFs.map((file, idx) => (
+                <Text style={styles.sectionLabel}>Model</Text>
+                <Text style={styles.modelName}>{GEMMA_MODEL.displayName}</Text>
+                <Text style={styles.modelMeta}>
+                  Quantization: Q4_K_S  ·  {GEMMA_MODEL.sizeHint}
+                </Text>
+                <Text style={[styles.hintText, {marginTop: 6}]}>
+                  తెలుగు భాషలో వ్యవసాయ సహాయం అందించే Gemma 3 1B మోడల్.
+                </Text>
+
+                {modelReady ? (
+                  <View style={{gap: 10, marginTop: 16}}>
+                    <TouchableOpacity
+                      style={styles.primaryBtn}
+                      onPress={() => setCurrentPage('conversation')}>
+                      <Text style={styles.primaryBtnText}>Chat తెరవండి →</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.dangerBtn}
+                      onPress={handleDeleteModel}>
+                      <Text style={styles.dangerBtnText}>Model File తొలగించండి</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
                   <TouchableOpacity
-                    key={idx}
-                    style={[
-                      styles.optionBtn,
-                      selectedGGUF === file && styles.optionBtnSelected,
-                    ]}
-                    onPress={() => handleGGUFSelection(file)}>
-                    <Text
-                      style={[
-                        styles.optionBtnTextSmall,
-                        selectedGGUF === file && styles.optionBtnTextSelected,
-                      ]}>
-                      {file}
+                    style={[styles.primaryBtn, {marginTop: 16}]}
+                    onPress={handleDownload}>
+                    <Text style={styles.primaryBtnText}>
+                      ⬇ Download &amp; Load Model
                     </Text>
                   </TouchableOpacity>
-                ))}
+                )}
               </View>
-            )}
-          </ScrollView>
-        )}
 
-        {/* ═══════════════════════════════════════════════════════════════════
-            PAGE: DOWNLOADING
-        ═══════════════════════════════════════════════════════════════════ */}
-        {isDownloading && (
-          <View style={styles.centeredCard}>
-            <Text style={styles.sectionLabel}>Downloading</Text>
-            <Text style={styles.smallLabel}>{selectedGGUF}</Text>
-            <ProgressBar progress={downloadProgress} />
-            <Text style={styles.progressPct}>
-              {Math.round(downloadProgress * 100)}%
-            </Text>
-          </View>
-        )}
-
-        {/* ═══════════════════════════════════════════════════════════════════
-            PAGE: RAG SETUP
-        ═══════════════════════════════════════════════════════════════════ */}
-        {currentPage === 'ragSetup' && (
-          <ScrollView contentContainerStyle={styles.scrollContent}>
-            <Text style={styles.pageTitle}>Document Setup</Text>
-
-            {/* RAG toggle */}
-            <View style={styles.card}>
-              <Text style={styles.sectionLabel}>RAG Mode</Text>
-              <TouchableOpacity
-                style={[
-                  styles.toggleBtn,
-                  ragEnabled ? styles.toggleBtnOn : styles.toggleBtnOff,
-                  (!chunksLoaded || !embeddingReady) && styles.toggleBtnDisabled,
-                ]}
-                disabled={!chunksLoaded || !embeddingReady}
-                onPress={() => setRagEnabled(prev => !prev)}>
-                <Text style={styles.toggleBtnText}>
-                  {ragEnabled ? '✓ RAG Enabled' : 'RAG Disabled'}
-                </Text>
-              </TouchableOpacity>
-              {!chunksLoaded && (
-                <Text style={styles.hintText}>
-                  Load a document below to enable RAG.
-                </Text>
-              )}
-            </View>
-
-            {/* Paste document */}
-            <View style={styles.card}>
-              <Text style={styles.sectionLabel}>Paste Document Text</Text>
-              <TextInput
-                style={styles.docInput}
-                placeholder="Paste your document text here…"
-                placeholderTextColor="#94A3B8"
-                multiline
-                numberOfLines={10}
-                value={docText}
-                onChangeText={setDocText}
-                textAlignVertical="top"
-              />
-              {isIngesting ? (
-                <View style={styles.ingestProgress}>
-                  <ActivityIndicator size="small" color="#3B82F6" />
-                  <Text style={styles.ingestProgressText}>
-                    Embedding chunk {ingestProgress.done} / {ingestProgress.total}…
-                  </Text>
-                </View>
-              ) : (
-                <TouchableOpacity
-                  style={[
-                    styles.primaryBtn,
-                    (!embeddingReady || !docText.trim()) && styles.primaryBtnDisabled,
-                  ]}
-                  disabled={!embeddingReady || !docText.trim()}
-                  onPress={handleIngestDocument}>
-                  <Text style={styles.primaryBtnText}>Embed & Index Document</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-
-            {/* Clear */}
-            {chunksLoaded && (
               <View style={styles.card}>
-                <Text style={styles.sectionLabel}>Manage Index</Text>
-                <TouchableOpacity
-                  style={styles.dangerBtn}
-                  onPress={handleClearRAG}>
-                  <Text style={styles.dangerBtnText}>🗑 Clear Document Index</Text>
-                </TouchableOpacity>
+                <Text style={styles.sectionLabel}>Smart RAG Logic (LLM నిర్ణయిస్తుంది)</Text>
+                <Text style={styles.hintText}>
+                  {'🤖 మీ ప్రశ్న → LLM వ్యవసాయమా కాదా అని నిర్ణయిస్తుంది\n'}
+                  {'🌾 వ్యవసాయ + మంచి chunks → RAG సమాధానం\n'}
+                  {'⚠️  వ్యవసాయ + బలహీన chunks → RAG + LLM కలిపి\n'}
+                  {'🔍 వ్యవసాయ + chunks లేవు → LLM స్వయంగా సమాధానం\n'}
+                  {'💬 వ్యవసాయం కాదు → LLM మాత్రమే (RAG లేదు)'}
+                </Text>
               </View>
-            )}
-          </ScrollView>
-        )}
 
-        {/* ═══════════════════════════════════════════════════════════════════
-            PAGE: CONVERSATION
-        ═══════════════════════════════════════════════════════════════════ */}
-        {currentPage === 'conversation' && !isDownloading && (
-          <>
-            <ScrollView
-              ref={scrollRef}
-              style={styles.chatScroll}
-              contentContainerStyle={styles.chatContent}>
+              <View style={styles.card}>
+                <Text style={styles.sectionLabel}>Token Budget / Turn</Text>
+                <Text style={styles.hintText}>
+                  {'Question      →  128 tokens\n'}
+                  {'3 chunks×150  →  ~450 tokens\n'}
+                  {'LLM reply     →  ~300 tokens\n'}
+                  {'Classifier    →  ~50 tokens\n'}
+                  {'─────────────────────────────\n'}
+                  {`Per turn ≈ 1 000 tokens\n`}
+                  {`${MAX_TURNS_IN_CONTEXT} turns kept in context ≈ 2 000 tokens (n_ctx=2048)`}
+                </Text>
+              </View>
+            </ScrollView>
+          )}
 
-              {/* RAG active badge */}
-              {ragEnabled && chunksLoaded && (
-                <View style={styles.ragBadge}>
-                  <Text style={styles.ragBadgeText}>
-                    📄 RAG active — answers grounded in your document
-                  </Text>
-                </View>
-              )}
+          {/* ══════════════════ PAGE: DOWNLOADING ══════════════════ */}
+          {isDownloading && (
+            <View style={styles.centeredCard}>
+              <Text style={styles.sectionLabel}>డౌన్లోడ్ అవుతోంది</Text>
+              <Text style={styles.modelName}>{GEMMA_MODEL.displayName}</Text>
+              <Text style={styles.modelMeta}>{GEMMA_MODEL.sizeHint}</Text>
+              <ProgressBar progress={downloadProgress / 100} />
+              <Text style={styles.progressPct}>{downloadProgress}%</Text>
+              <Text style={[styles.hintText, {textAlign: 'center', marginTop: 12}]}>
+                100% వద్ద ఆగిపోతే, model URL మార్చాల్సి ఉండవచ్చు.
+              </Text>
+            </View>
+          )}
 
-              {!llmContext && (
-                <View style={styles.emptyState}>
-                  <Text style={styles.emptyStateText}>
-                    ← Go back to select and download a model to start chatting.
-                  </Text>
-                </View>
-              )}
+          {/* ══════════════════ PAGE: RAG SETUP ══════════════════ */}
+          {currentPage === 'ragSetup' && (
+            <ScrollView contentContainerStyle={styles.scrollContent}>
+              <Text style={styles.pageTitle}>Document Setup</Text>
 
-              {conversation.slice(1).map((msg, idx) => (
-                <View
-                  key={idx}
+              <View style={styles.card}>
+                <Text style={styles.sectionLabel}>RAG Mode</Text>
+                <TouchableOpacity
                   style={[
-                    styles.bubbleWrapper,
-                    msg.role === 'user'
-                      ? styles.bubbleWrapperUser
-                      : styles.bubbleWrapperAssistant,
-                  ]}>
-                  {msg.role === 'assistant' && (
-                    <Text style={styles.roleLabel}>🦙 Llama</Text>
-                  )}
-                  <View
+                    styles.toggleBtn,
+                    ragEnabled ? styles.toggleBtnOn : styles.toggleBtnOff,
+                    (!chunksLoaded || !embeddingReady) && styles.toggleBtnDisabled,
+                  ]}
+                  disabled={!chunksLoaded || !embeddingReady}
+                  onPress={() => setRagEnabled(p => !p)}>
+                  <Text style={styles.toggleBtnText}>
+                    {ragEnabled ? '✓ RAG Enabled' : 'RAG Disabled'}
+                  </Text>
+                </TouchableOpacity>
+                {!chunksLoaded && (
+                  <Text style={styles.hintText}>
+                    Knowledge DB లోడ్ చేయండి.
+                  </Text>
+                )}
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.sectionLabel}>Knowledge Database</Text>
+                <Text style={styles.hintText}>
+                  {'Bundled: knowledge.db (Python లో నిర్మించబడింది)\n'}
+                  {knowledgeChunkCount
+                    ? `Chunks: ${knowledgeChunkCount}`
+                    : 'ఇంకా chunks లోడ్ కాలేదు.'}
+                </Text>
+                {isIngesting ? (
+                  <View style={styles.ingestProgress}>
+                    <ActivityIndicator size="small" color={BLUE} />
+                    <Text style={styles.ingestProgressText}>లోడ్ అవుతోంది…</Text>
+                  </View>
+                ) : (
+                  <TouchableOpacity
                     style={[
-                      styles.bubble,
-                      msg.role === 'user'
-                        ? styles.bubbleUser
-                        : styles.bubbleAssistant,
-                    ]}>
-                    <Text
-                      style={[
-                        styles.bubbleText,
-                        msg.role === 'user' && styles.bubbleTextUser,
-                      ]}>
-                      {/* Show displayContent (original question) for user; full text for assistant */}
-                      {msg.role === 'user'
-                        ? msg.displayContent ?? msg.content
-                        : msg.content}
+                      styles.primaryBtn,
+                      {marginTop: 12},
+                      !embeddingReady && styles.primaryBtnDisabled,
+                    ]}
+                    disabled={!embeddingReady}
+                    onPress={handleReloadDB}>
+                    <Text style={styles.primaryBtnText}>Knowledge DB రీలోడ్</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </ScrollView>
+          )}
+
+          {/* ══════════════════ PAGE: CONVERSATION ══════════════════ */}
+          {currentPage === 'conversation' && !isDownloading && (
+            <>
+              <ScrollView
+                ref={scrollRef}
+                style={styles.chatScroll}
+                contentContainerStyle={styles.chatContent}>
+
+                {ragEnabled && chunksLoaded && (
+                  <View style={styles.ragBadge}>
+                    <Text style={styles.ragBadgeText}>
+                      🌾 Smart RAG active · LLM నిర్ణయం
                     </Text>
                   </View>
-                </View>
-              ))}
+                )}
 
-              {isGenerating && (
-                <View style={[styles.bubbleWrapper, styles.bubbleWrapperAssistant]}>
-                  <Text style={styles.roleLabel}>🦙 Llama</Text>
-                  <View style={[styles.bubble, styles.bubbleAssistant]}>
-                    <ActivityIndicator size="small" color="#3B82F6" />
+                {turns.length > 0 && (
+                  <View style={styles.windowBanner}>
+                    <Text style={styles.windowBannerText}>
+                      Context: {turnsInWindow}/{MAX_TURNS_IN_CONTEXT} turns
+                      {turnsDropped > 0
+                        ? `  ·  ${turnsDropped} turn${turnsDropped > 1 ? 's' : ''} తీసివేయబడ్డాయి`
+                        : ''}
+                    </Text>
                   </View>
-                </View>
-              )}
-            </ScrollView>
+                )}
 
-            {/* ── Input bar ─────────────────────────────────────────────── */}
-            <View style={styles.inputBar}>
-              {/* RAG quick toggle */}
-              {embeddingReady && chunksLoaded && (
+                {!llmContext && (
+                  <View style={styles.emptyState}>
+                    <Text style={styles.emptyStateText}>
+                      ముందుగా Home లో model డౌన్లోడ్ చేయండి.
+                    </Text>
+                  </View>
+                )}
+
+                {turns.map((turn, idx) => {
+                  const isOutside = idx < turns.length - MAX_TURNS_IN_CONTEXT;
+                  const dm = turn.ragDecision ? DECISION_META[turn.ragDecision] : null;
+
+                  return (
+                    <View key={idx}>
+                      {isOutside && (
+                        <Text style={styles.outsideWindowLabel}>
+                          ↑ LLM context బయట
+                        </Text>
+                      )}
+
+                      {/* User bubble */}
+                      <View style={[
+                        styles.bubbleWrapper,
+                        styles.bubbleWrapperUser,
+                        isOutside && styles.fadedOpacity,
+                      ]}>
+                        <View style={[styles.bubble, styles.bubbleUser]}>
+                          <Text style={[styles.bubbleText, styles.bubbleTextUser]}>
+                            {turn.userDisplay}
+                          </Text>
+                        </View>
+
+                        {dm && (
+                          <View style={[styles.decisionBadge, {backgroundColor: dm.bg}]}>
+                            <Text style={[styles.decisionBadgeText, {color: dm.color}]}>
+                              {dm.label}
+                            </Text>
+                          </View>
+                        )}
+
+                        {turn.ragChunks.length > 0 && (
+                          <View style={styles.retrievedPanel}>
+                            <Text style={styles.retrievedTitle}>
+                              {turn.ragChunks.length} chunk
+                              {turn.ragChunks.length > 1 ? 's' : ''} retrieved
+                              {' '}(≤150 words each)
+                            </Text>
+                            {turn.ragChunks.map((chunk, ci) => (
+                              <View key={`${chunk.id}-${ci}`} style={styles.chunkCard}>
+                                <Text style={styles.chunkMeta}>
+                                  #{ci + 1} · id:{chunk.id}
+                                  {chunk.page != null ? ` · p.${chunk.page}` : ''}
+                                  {Number.isFinite(Number(chunk.distance))
+                                    ? ` · dist:${Number(chunk.distance).toFixed(3)}`
+                                    : ''}
+                                </Text>
+                                <Text style={styles.chunkText}>{chunk.text}</Text>
+                                {chunk.source ? (
+                                  <Text style={styles.chunkSource}>{chunk.source}</Text>
+                                ) : null}
+                              </View>
+                            ))}
+                          </View>
+                        )}
+                      </View>
+
+                      {/* Assistant bubble */}
+                      <View style={[
+                        styles.bubbleWrapper,
+                        styles.bubbleWrapperAssistant,
+                        isOutside && styles.fadedOpacity,
+                      ]}>
+                        <Text style={styles.roleLabel}>🌾 Gemma తెలుగు</Text>
+                        <View style={[styles.bubble, styles.bubbleAssistant]}>
+                          <Text style={styles.bubbleText}>{turn.assistantReply}</Text>
+                        </View>
+                      </View>
+                    </View>
+                  );
+                })}
+
+                {/* Classifying spinner (shown before streaming starts) */}
+                {isClassifying && !streamingText && (
+                  <View style={[styles.bubbleWrapper, styles.bubbleWrapperAssistant]}>
+                    <Text style={styles.roleLabel}>🤖 వర్గీకరిస్తోంది…</Text>
+                    <View style={[styles.bubble, styles.bubbleAssistant, styles.classifyingBubble]}>
+                      <ActivityIndicator size="small" color={BLUE} />
+                      <Text style={styles.classifyingText}>
+                        ప్రశ్న విశ్లేషిస్తోంది…
+                      </Text>
+                    </View>
+                  </View>
+                )}
+
+                {/* Streaming bubble */}
+                {isGenerating && !isClassifying && (
+                  <View style={[styles.bubbleWrapper, styles.bubbleWrapperAssistant]}>
+                    <Text style={styles.roleLabel}>🌾 Gemma తెలుగు</Text>
+                    <View style={[styles.bubble, styles.bubbleAssistant]}>
+                      {streamingText ? (
+                        <Text style={styles.bubbleText}>{streamingText}</Text>
+                      ) : (
+                        <ActivityIndicator size="small" color={BLUE} />
+                      )}
+                    </View>
+                  </View>
+                )}
+              </ScrollView>
+
+              {/* Input bar */}
+              <View style={styles.inputBar}>
+                {embeddingReady && chunksLoaded && (
+                  <TouchableOpacity
+                    style={[
+                      styles.ragToggleChip,
+                      ragEnabled ? styles.ragToggleChipOn : styles.ragToggleChipOff,
+                    ]}
+                    onPress={() => setRagEnabled(p => !p)}>
+                    <Text style={styles.ragToggleChipText}>
+                      {ragEnabled ? '🌾' : '💬'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+                <TextInput
+                  style={styles.textInput}
+                  placeholder={
+                    llmContext
+                      ? ragEnabled
+                        ? 'పంటలు, నేల, తెగుళ్ళ గురించి అడగండి…'
+                        : 'సందేశం టైప్ చేయండి…'
+                      : 'ముందుగా model లోడ్ చేయండి…'
+                  }
+                  placeholderTextColor="#94A3B8"
+                  value={userInput}
+                  onChangeText={setUserInput}
+                  multiline
+                  editable={!!llmContext && !isGenerating}
+                  onSubmitEditing={handleSendMessage}
+                  blurOnSubmit={false}
+                />
                 <TouchableOpacity
                   style={[
-                    styles.ragToggleChip,
-                    ragEnabled ? styles.ragToggleChipOn : styles.ragToggleChipOff,
+                    styles.sendBtn,
+                    (!llmContext || isGenerating || !userInput.trim()) &&
+                      styles.sendBtnDisabled,
                   ]}
-                  onPress={() => setRagEnabled(p => !p)}>
-                  <Text style={styles.ragToggleChipText}>
-                    {ragEnabled ? '📄 RAG' : '💬 RAG'}
+                  onPress={handleSendMessage}
+                  disabled={!llmContext || isGenerating || !userInput.trim()}>
+                  <Text style={styles.sendBtnText}>
+                    {isGenerating ? '…' : '↑'}
                   </Text>
                 </TouchableOpacity>
-              )}
+              </View>
+            </>
+          )}
 
-              <TextInput
-                style={styles.textInput}
-                placeholder={
-                  llmContext
-                    ? ragEnabled
-                      ? 'Ask about your document…'
-                      : 'Type a message…'
-                    : 'Load a model first…'
-                }
-                placeholderTextColor="#94A3B8"
-                value={userInput}
-                onChangeText={setUserInput}
-                multiline
-                editable={!!llmContext && !isGenerating}
-                onSubmitEditing={handleSendMessage}
-                blurOnSubmit={false}
-              />
-
+          {/* Tab bar */}
+          {!isDownloading && currentPage !== 'ragSetup' && (
+            <View style={styles.tabBar}>
+              <TouchableOpacity
+                style={[styles.tabBtn, currentPage === 'home' && styles.tabBtnActive]}
+                onPress={() => setCurrentPage('home')}>
+                <Text style={[
+                  styles.tabBtnText,
+                  currentPage === 'home' && styles.tabBtnTextActive,
+                ]}>Home</Text>
+              </TouchableOpacity>
               <TouchableOpacity
                 style={[
-                  styles.sendBtn,
-                  (!llmContext || isGenerating || !userInput.trim()) &&
-                    styles.sendBtnDisabled,
+                  styles.tabBtn,
+                  currentPage === 'conversation' && styles.tabBtnActive,
+                  !llmContext && styles.tabBtnDisabled,
                 ]}
-                onPress={handleSendMessage}
-                disabled={!llmContext || isGenerating || !userInput.trim()}>
-                <Text style={styles.sendBtnText}>
-                  {isGenerating ? '…' : '↑'}
-                </Text>
-              </TouchableOpacity>
-            </View>
-          </>
-        )}
-
-        {/* ── Bottom nav (model selection ↔ conversation) ─────────────────── */}
-        {!isDownloading && currentPage !== 'ragSetup' && (
-          <View style={styles.tabBar}>
-            <TouchableOpacity
-              style={[
-                styles.tabBtn,
-                currentPage === 'modelSelection' && styles.tabBtnActive,
-              ]}
-              onPress={() => setCurrentPage('modelSelection')}>
-              <Text
-                style={[
-                  styles.tabBtnText,
-                  currentPage === 'modelSelection' && styles.tabBtnTextActive,
-                ]}>
-                Models
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[
-                styles.tabBtn,
-                currentPage === 'conversation' && styles.tabBtnActive,
-                !llmContext && styles.tabBtnDisabled,
-              ]}
-              disabled={!llmContext}
-              onPress={() => setCurrentPage('conversation')}>
-              <Text
-                style={[
+                disabled={!llmContext}
+                onPress={() => setCurrentPage('conversation')}>
+                <Text style={[
                   styles.tabBtnText,
                   currentPage === 'conversation' && styles.tabBtnTextActive,
                   !llmContext && styles.tabBtnTextDisabled,
-                ]}>
-                Chat {llmContext ? '●' : '○'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        )}
-      </KeyboardAvoidingView>
-    </SafeAreaView>
+                ]}>Chat {llmContext ? '●' : '○'}</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -703,286 +785,158 @@ function App(): React.JSX.Element {
 // STYLES
 // ─────────────────────────────────────────────────────────────────────────────
 
-const BLUE = '#3B82F6';
+const BLUE       = '#3B82F6';
 const BLUE_LIGHT = '#93C5FD';
-const BLUE_DARK = '#1D4ED8';
-const SURFACE = '#F8FAFC';
-const CARD_BG = '#FFFFFF';
-const BORDER = '#E2E8F0';
-const TEXT_MAIN = '#1E293B';
-const TEXT_SUB = '#64748B';
+const BLUE_DARK  = '#1D4ED8';
+const SURFACE    = '#F8FAFC';
+const CARD_BG    = '#FFFFFF';
+const BORDER     = '#E2E8F0';
+const TEXT_MAIN  = '#1E293B';
+const TEXT_SUB   = '#64748B';
 const TEXT_MUTED = '#94A3B8';
-const GREEN = '#22C55E';
-const RED = '#EF4444';
+const GREEN      = '#22C55E';
+const RED        = '#EF4444';
 
 const styles = StyleSheet.create({
   root: {flex: 1, backgroundColor: SURFACE},
   flex: {flex: 1},
 
-  // ── Header ────────────────────────────────────────────────────────────────
   header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: CARD_BG,
-    borderBottomWidth: 1,
-    borderBottomColor: BORDER,
-    elevation: 2,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingVertical: 12,
+    backgroundColor: CARD_BG, borderBottomWidth: 1, borderBottomColor: BORDER, elevation: 2,
   },
-  headerTitle: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: TEXT_MAIN,
-    letterSpacing: 0.3,
-  },
-  headerRight: {flexDirection: 'row', gap: 8},
-  headerBtn: {
-    backgroundColor: BLUE_LIGHT,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-  },
+  headerTitle:   {fontSize: 20, fontWeight: '700', color: TEXT_MAIN},
+  headerRight:   {flexDirection: 'row', gap: 8},
+  headerBtn:     {backgroundColor: BLUE_LIGHT, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20},
   headerBtnText: {fontSize: 13, fontWeight: '600', color: BLUE_DARK},
 
-  // ── Status bar ────────────────────────────────────────────────────────────
-  statusBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 6,
-  },
-  statusReady: {backgroundColor: '#16A34A'},
-  statusLoading: {backgroundColor: '#F59E0B'},
-  statusText: {fontSize: 12, color: '#FFFFFF', fontWeight: '500'},
+  statusBar:    {flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 6},
+  statusReady:  {backgroundColor: '#16A34A'},
+  statusLoading:{backgroundColor: '#F59E0B'},
+  statusText:   {fontSize: 12, color: '#FFFFFF', fontWeight: '500'},
 
-  // ── Scroll pages ──────────────────────────────────────────────────────────
   scrollContent: {padding: 16, paddingBottom: 32},
-  pageTitle: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: TEXT_MAIN,
-    marginBottom: 16,
-    marginTop: 4,
-  },
+  pageTitle:     {fontSize: 22, fontWeight: '700', color: TEXT_MAIN, marginBottom: 16, marginTop: 4},
   card: {
-    backgroundColor: CARD_BG,
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: BORDER,
-    elevation: 1,
+    backgroundColor: CARD_BG, borderRadius: 16, padding: 16, marginBottom: 16,
+    borderWidth: 1, borderColor: BORDER, elevation: 1,
   },
   sectionLabel: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: TEXT_SUB,
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
-    marginBottom: 12,
+    fontSize: 13, fontWeight: '700', color: TEXT_SUB,
+    textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8,
   },
+  modelName: {fontSize: 17, fontWeight: '700', color: TEXT_MAIN, marginBottom: 4},
+  modelMeta: {fontSize: 12, color: TEXT_MUTED, marginBottom: 4},
+  hintText:  {fontSize: 12, color: TEXT_MUTED, lineHeight: 20},
 
-  // ── Option buttons (model / GGUF selection) ───────────────────────────────
-  optionBtn: {
-    borderWidth: 1.5,
-    borderColor: BORDER,
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    marginBottom: 8,
-    backgroundColor: SURFACE,
-  },
-  optionBtnSelected: {borderColor: BLUE, backgroundColor: '#EFF6FF'},
-  optionBtnText: {fontSize: 15, color: TEXT_MAIN, fontWeight: '500'},
-  optionBtnTextSmall: {fontSize: 12, color: TEXT_MAIN, fontWeight: '400'},
-  optionBtnTextSelected: {color: BLUE, fontWeight: '700'},
-
-  // ── Download page ─────────────────────────────────────────────────────────
   centeredCard: {
-    flex: 1,
-    justifyContent: 'center',
-    padding: 32,
-    margin: 24,
-    backgroundColor: CARD_BG,
-    borderRadius: 20,
-    elevation: 2,
-    borderWidth: 1,
-    borderColor: BORDER,
+    flex: 1, justifyContent: 'center', padding: 32, margin: 24,
+    backgroundColor: CARD_BG, borderRadius: 20, elevation: 2, borderWidth: 1, borderColor: BORDER,
   },
-  smallLabel: {fontSize: 12, color: BLUE_LIGHT, marginBottom: 16, fontWeight: '500'},
-  progressPct: {
-    textAlign: 'center',
-    marginTop: 8,
-    fontSize: 18,
-    fontWeight: '700',
-    color: BLUE,
-  },
+  progressPct: {textAlign: 'center', marginTop: 8, fontSize: 18, fontWeight: '700', color: BLUE},
 
-  // ── RAG Setup ─────────────────────────────────────────────────────────────
-  toggleBtn: {
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-    marginBottom: 4,
-  },
-  toggleBtnOn: {backgroundColor: GREEN},
-  toggleBtnOff: {backgroundColor: BORDER},
+  toggleBtn:         {paddingVertical: 12, borderRadius: 12, alignItems: 'center', marginBottom: 4},
+  toggleBtnOn:       {backgroundColor: GREEN},
+  toggleBtnOff:      {backgroundColor: BORDER},
   toggleBtnDisabled: {opacity: 0.5},
-  toggleBtnText: {fontSize: 15, fontWeight: '700', color: '#FFFFFF'},
-  hintText: {fontSize: 12, color: TEXT_MUTED, marginTop: 8},
+  toggleBtnText:     {fontSize: 15, fontWeight: '700', color: '#FFFFFF'},
 
-  docInput: {
-    borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 12,
-    padding: 12,
-    fontSize: 14,
-    color: TEXT_MAIN,
-    minHeight: 160,
-    marginBottom: 12,
-    backgroundColor: SURFACE,
-  },
-  ingestProgress: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    paddingVertical: 12,
-  },
+  ingestProgress:     {flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12},
   ingestProgressText: {fontSize: 13, color: TEXT_SUB},
 
-  primaryBtn: {
-    backgroundColor: BLUE,
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
+  primaryBtn:         {backgroundColor: BLUE, paddingVertical: 14, borderRadius: 12, alignItems: 'center'},
   primaryBtnDisabled: {opacity: 0.4},
-  primaryBtnText: {fontSize: 15, fontWeight: '700', color: '#FFFFFF'},
+  primaryBtnText:     {fontSize: 15, fontWeight: '700', color: '#FFFFFF'},
+  dangerBtn:          {borderWidth: 1.5, borderColor: RED, paddingVertical: 12, borderRadius: 12, alignItems: 'center'},
+  dangerBtnText:      {fontSize: 14, color: RED, fontWeight: '600'},
 
-  dangerBtn: {
-    borderWidth: 1.5,
-    borderColor: RED,
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  dangerBtnText: {fontSize: 14, color: RED, fontWeight: '600'},
-
-  // ── Chat ──────────────────────────────────────────────────────────────────
-  chatScroll: {flex: 1},
+  chatScroll:  {flex: 1},
   chatContent: {padding: 16, paddingBottom: 8},
 
   ragBadge: {
-    backgroundColor: '#EFF6FF',
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    alignSelf: 'center',
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: BLUE_LIGHT,
+    backgroundColor: '#ECFDF5', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 6,
+    alignSelf: 'center', marginBottom: 8, borderWidth: 1, borderColor: '#6EE7B7',
   },
-  ragBadgeText: {fontSize: 12, color: BLUE, fontWeight: '600'},
+  ragBadgeText: {fontSize: 12, color: '#065F46', fontWeight: '600'},
 
-  emptyState: {
-    flex: 1,
-    alignItems: 'center',
-    paddingTop: 60,
-    paddingHorizontal: 32,
+  windowBanner: {
+    backgroundColor: '#FEF9C3', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 5,
+    alignSelf: 'center', marginBottom: 10, borderWidth: 1, borderColor: '#FDE047',
   },
-  emptyStateText: {
-    fontSize: 15,
-    color: TEXT_MUTED,
-    textAlign: 'center',
-    lineHeight: 22,
-  },
+  windowBannerText: {fontSize: 11, color: '#713F12', fontWeight: '500'},
 
-  bubbleWrapper: {marginBottom: 12},
-  bubbleWrapperUser: {alignItems: 'flex-end'},
+  outsideWindowLabel: {
+    fontSize: 10, color: TEXT_MUTED, textAlign: 'center',
+    marginTop: 8, marginBottom: 2, fontStyle: 'italic',
+  },
+  fadedOpacity: {opacity: 0.45},
+
+  emptyState:     {alignItems: 'center', paddingTop: 60, paddingHorizontal: 32},
+  emptyStateText: {fontSize: 15, color: TEXT_MUTED, textAlign: 'center', lineHeight: 22},
+
+  bubbleWrapper:          {marginBottom: 8},
+  bubbleWrapperUser:      {alignItems: 'flex-end'},
   bubbleWrapperAssistant: {alignItems: 'flex-start'},
-  roleLabel: {fontSize: 11, color: TEXT_MUTED, marginBottom: 4, marginLeft: 4},
+  roleLabel:              {fontSize: 11, color: TEXT_MUTED, marginBottom: 3, marginLeft: 4},
 
-  bubble: {
-    maxWidth: '82%',
-    padding: 12,
-    borderRadius: 16,
-  },
-  bubbleUser: {
-    backgroundColor: BLUE,
-    borderBottomRightRadius: 4,
-  },
+  bubble:          {maxWidth: '82%', padding: 12, borderRadius: 16},
+  bubbleUser:      {backgroundColor: BLUE, borderBottomRightRadius: 4},
   bubbleAssistant: {
-    backgroundColor: CARD_BG,
-    borderWidth: 1,
-    borderColor: BORDER,
-    borderBottomLeftRadius: 4,
-    elevation: 1,
+    backgroundColor: CARD_BG, borderWidth: 1, borderColor: BORDER,
+    borderBottomLeftRadius: 4, elevation: 1,
   },
-  bubbleText: {fontSize: 15, color: TEXT_MAIN, lineHeight: 22},
+  bubbleText:     {fontSize: 15, color: TEXT_MAIN, lineHeight: 22},
   bubbleTextUser: {color: '#FFFFFF'},
 
-  // ── Input bar ─────────────────────────────────────────────────────────────
+  // Classifying indicator bubble
+  classifyingBubble: {flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 10},
+  classifyingText:   {fontSize: 13, color: TEXT_MUTED, fontStyle: 'italic'},
+
+  decisionBadge: {
+    alignSelf: 'flex-end', marginTop: 4, marginRight: 4,
+    paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20,
+  },
+  decisionBadgeText: {fontSize: 11, fontWeight: '600'},
+
+  retrievedPanel: {
+    width: '92%', marginTop: 6, padding: 10, borderRadius: 10,
+    backgroundColor: '#F8FAFC', borderWidth: 1, borderColor: BORDER,
+  },
+  retrievedTitle: {
+    fontSize: 11, fontWeight: '700', color: TEXT_SUB, marginBottom: 6,
+    textTransform: 'uppercase', letterSpacing: 0.5,
+  },
+  chunkCard:   {paddingTop: 6, marginTop: 6, borderTopWidth: 1, borderTopColor: BORDER},
+  chunkMeta:   {fontSize: 10, fontWeight: '700', color: BLUE_DARK, marginBottom: 3},
+  chunkText:   {fontSize: 11, color: TEXT_MAIN, lineHeight: 17},
+  chunkSource: {fontSize: 10, color: TEXT_MUTED, marginTop: 4},
+
   inputBar: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    gap: 8,
-    padding: 12,
-    backgroundColor: CARD_BG,
-    borderTopWidth: 1,
-    borderTopColor: BORDER,
+    flexDirection: 'row', alignItems: 'flex-end', gap: 8, padding: 12,
+    backgroundColor: CARD_BG, borderTopWidth: 1, borderTopColor: BORDER,
   },
-  ragToggleChip: {
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 20,
-    alignSelf: 'flex-end',
-  },
-  ragToggleChipOn: {backgroundColor: GREEN},
+  ragToggleChip:    {paddingHorizontal: 10, paddingVertical: 8, borderRadius: 20, alignSelf: 'flex-end'},
+  ragToggleChipOn:  {backgroundColor: GREEN},
   ragToggleChipOff: {backgroundColor: BORDER},
-  ragToggleChipText: {fontSize: 12, fontWeight: '700', color: '#FFFFFF'},
+  ragToggleChipText:{fontSize: 14, fontWeight: '700', color: '#FFFFFF'},
 
   textInput: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    fontSize: 15,
-    color: TEXT_MAIN,
-    maxHeight: 120,
-    backgroundColor: SURFACE,
+    flex: 1, borderWidth: 1, borderColor: BORDER, borderRadius: 20,
+    paddingHorizontal: 16, paddingVertical: 10, fontSize: 15, color: TEXT_MAIN,
+    maxHeight: 120, backgroundColor: SURFACE,
   },
-  sendBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: BLUE,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  sendBtn:         {width: 44, height: 44, borderRadius: 22, backgroundColor: BLUE, alignItems: 'center', justifyContent: 'center'},
   sendBtnDisabled: {backgroundColor: BORDER},
-  sendBtnText: {fontSize: 20, color: '#FFFFFF', fontWeight: '700'},
+  sendBtnText:     {fontSize: 20, color: '#FFFFFF', fontWeight: '700'},
 
-  // ── Tab bar ───────────────────────────────────────────────────────────────
-  tabBar: {
-    flexDirection: 'row',
-    borderTopWidth: 1,
-    borderTopColor: BORDER,
-    backgroundColor: CARD_BG,
-  },
-  tabBtn: {
-    flex: 1,
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  tabBtnActive: {borderTopWidth: 2, borderTopColor: BLUE},
-  tabBtnDisabled: {opacity: 0.4},
-  tabBtnText: {fontSize: 14, color: TEXT_MUTED, fontWeight: '500'},
-  tabBtnTextActive: {color: BLUE, fontWeight: '700'},
-  tabBtnTextDisabled: {color: TEXT_MUTED},
+  tabBar:            {flexDirection: 'row', borderTopWidth: 1, borderTopColor: BORDER, backgroundColor: CARD_BG},
+  tabBtn:            {flex: 1, paddingVertical: 14, alignItems: 'center'},
+  tabBtnActive:      {borderTopWidth: 2, borderTopColor: BLUE},
+  tabBtnDisabled:    {opacity: 0.4},
+  tabBtnText:        {fontSize: 14, color: TEXT_MUTED, fontWeight: '500'},
+  tabBtnTextActive:  {color: BLUE, fontWeight: '700'},
+  tabBtnTextDisabled:{color: TEXT_MUTED},
 });
 
 export default App;
