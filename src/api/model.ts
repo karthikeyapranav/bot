@@ -1,10 +1,15 @@
 import RNFS from 'react-native-fs';
 
+// ── Extract the raw file-ID from the share URL and build a direct-download link
+// Share URL:  https://drive.google.com/file/d/1ZXifmWlqdaUgFfVjsiS5jrrt6jrHuJjh/view?usp=sharing
+// Direct URL: https://drive.usercontent.google.com/download?id=<ID>&export=download&confirm=t
+const GDRIVE_FILE_ID = '1ZXifmWlqdaUgFfVjsiS5jrrt6jrHuJjh';
+
 export const GEMMA_MODEL = {
-  name: 'gemma-3-1b-Q2_K.gguf',
-  url: 'https://drive.usercontent.google.com/download?id=17Qo0qpaKVHSb83gHOSsnlt3gEh799CjW&export=download&authuser=0&confirm=t',
-  displayName: 'Gemma 3 1B · Q2_K',
-  sizeHint: '~500 MB',
+  name: 'gemma-3-1b-Q4_K_S.gguf',
+  url: `https://drive.usercontent.google.com/download?id=${GDRIVE_FILE_ID}&export=download&authuser=0&confirm=t`,
+  displayName: 'Gemma 3 1B · Q4_K_S',
+  sizeHint: '~750 MB',
 };
 
 export const downloadModel = async (

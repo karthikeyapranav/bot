@@ -7,26 +7,14 @@ const MAX_CHUNK_WORDS = 150;
 
 // Distance threshold — sqlite-vec returns L2 distance.
 // Empirically, distance > 1.0 means the chunk is probably unrelated.
-// Tune this if your DB uses cosine (lower threshold ~0.3).
 const RELEVANCE_THRESHOLD = 1.0;
 
-// ── Agriculture topic keywords ────────────────────────────────────────────────
-// If the user question contains NONE of these, skip RAG entirely and let
-// the LLM answer from its own knowledge.
-const AGRICULTURE_KEYWORDS = [
-  'crop', 'crops', 'farm', 'farming', 'farmer', 'soil', 'fertilizer',
-  'fertiliser', 'pesticide', 'irrigation', 'harvest', 'seed', 'seeds',
-  'plant', 'plants', 'cultivation', 'cultivate', 'paddy', 'rice', 'wheat',
-  'maize', 'corn', 'sorghum', 'millet', 'pulse', 'lentil', 'chickpea',
-  'vegetable', 'fruit', 'orchard', 'greenhouse', 'compost', 'manure',
-  'weed', 'pest', 'disease', 'blight', 'fungus', 'insect', 'drought',
-  'rainfall', 'season', 'rabi', 'kharif', 'zaid', 'yield', 'acres',
-  'hectare', 'field', 'agriculture', 'agricultural', 'agri', 'horticulture',
-  'floriculture', 'sericulture', 'aquaculture', 'livestock', 'poultry',
-  'cattle', 'dairy', 'goat', 'sheep', 'pH', 'nitrogen', 'phosphorus',
-  'potassium', 'NPK', 'urea', 'spray', 'sowing', 'transplant', 'pruning',
-  'tilling', 'ploughing', 'mulching', 'drip', 'sprinkler',
-];
+// ── LLM Completion callback type ─────────────────────────────────────────────
+// We accept a thin wrapper so rag.ts stays decoupled from llama.rn internals.
+// app.tsx will pass `(messages, onToken) => Promise<string>`.
+export type LLMCompletionFn = (
+  messages: {role: 'system' | 'user' | 'assistant'; content: string}[],
+) => Promise<string>;
 
 export type RAGDecision =
   | 'rag_good'        // question is agri + chunks are relevant
@@ -49,37 +37,66 @@ function truncateChunk(text: string, maxWords = MAX_CHUNK_WORDS): string {
 }
 
 /**
- * Checks if the question is agriculture-related by keyword matching.
- * Simple but fast — no embedding call needed for this check.
+ * Uses the LLM itself to decide if the question is agriculture-related.
+ *
+ * We give the model a tiny, deterministic classification prompt and ask
+ * it to reply with exactly one word: YES or NO.
+ *
+ * Falls back to `true` (assume agriculture) on any error so RAG is
+ * attempted rather than silently skipped.
  */
-function isAgricultureQuestion(question: string): boolean {
-  const lower = question.toLowerCase();
-  return AGRICULTURE_KEYWORDS.some(kw => lower.includes(kw));
+async function isAgricultureQuestion(
+  question: string,
+  llmComplete: LLMCompletionFn,
+): Promise<boolean> {
+  // Keep prompt as short as possible — 1B models drift on long instructions.
+  // Single-line system + minimal user message = most reliable YES/NO output.
+  const classifyPrompt = `Agriculture related? YES or NO.\nQuestion: ${question}\nAnswer:`;
+
+  try {
+    const reply = await llmComplete([
+      {role: 'system', content: 'You classify questions. Reply YES or NO only.'},
+      {role: 'user',   content: classifyPrompt},
+    ]);
+
+    const cleaned = reply.trim().toUpperCase();
+    console.log('[RAG classifier]', JSON.stringify(question), '→', cleaned);
+
+    // Accept Y/YES/Yes — also treat empty/garbage reply as YES (safe fallback)
+    if (cleaned === '' || cleaned === 'N' || cleaned.startsWith('NO')) {
+      return false;
+    }
+    return true; // YES, Yes, Y, or any unexpected output → try RAG
+  } catch (err) {
+    console.warn('[RAG classifier] LLM call failed, defaulting to YES:', err);
+    return true;
+  }
 }
 
 /**
  * Build the prompt to send to the LLM.
  *
- * Decision logic:
+ * Decision logic (now driven by LLM classifier, not keywords):
  *
- *  1. If NOT agriculture → skip RAG, return plain question.
- *     LLM answers from its own knowledge with no context block.
+ *  1. LLM says NOT agriculture → skip RAG, return plain question.
  *
- *  2. If agriculture + chunks retrieved with good distance → RAG prompt.
- *     LLM uses context to answer.
+ *  2. Agriculture + good chunks (distance ≤ threshold) → RAG prompt using
+ *     retrieved context only.
  *
- *  3. If agriculture + chunks retrieved but ALL have high distance (weak) →
- *     Tell LLM the context is weak, ask it to mention that and supplement
- *     with its own knowledge.
+ *  3. Agriculture + weak chunks (distance > threshold) → RAG prompt that
+ *     tells the LLM context is uncertain; supplement with own knowledge.
  *
- *  4. If agriculture + zero chunks → plain question, LLM answers itself.
+ *  4. Agriculture + zero chunks → plain question, LLM answers itself.
  */
 export async function buildRAGPrompt(
   userQuestion: string,
+  llmComplete: LLMCompletionFn,
 ): Promise<RAGPromptResult> {
 
-  // ── Step 1: Topic check ───────────────────────────────────────────────────
-  if (!isAgricultureQuestion(userQuestion)) {
+  // ── Step 1: LLM topic classification ─────────────────────────────────────
+  const isAgri = await isAgricultureQuestion(userQuestion, llmComplete);
+
+  if (!isAgri) {
     return {
       prompt: userQuestion,
       chunks: [],
@@ -124,25 +141,21 @@ export async function buildRAGPrompt(
   let prompt: string;
 
   if (isWeak) {
-    // Weak retrieval — tell LLM the context may not be perfect
     prompt =
-      `You are an agricultural expert. The following passages may be relevant.\n\n` +
+      `మీరు వ్యవసాయ నిపుణుడు. క్రింది సమాచారం సంబంధితంగా ఉండవచ్చు.\n\n` +
       `${contextBlock}\n\n` +
-      `Answer this question using the passages above AND your own agricultural knowledge. ` +
-      `Do not ask the user for more information. Give a direct answer.\n\n` +
-      `Respond in the same language as the question.\n` +
-      `Question: ${userQuestion}\n` +
-      `Answer:`;
+      `పై సమాచారాన్ని మరియు మీ స్వంత వ్యవసాయ జ్ఞానాన్ని ఉపయోగించి సమాధానం ఇవ్వండి. ` +
+      `తెలుగులో సమాధానం ఇవ్వండి.\n` +
+      `ప్రశ్న: ${userQuestion}\n` +
+      `సమాధానం:`;
   } else {
-    // Good retrieval
     prompt =
-      `You are an agricultural expert. The following passages are from an agriculture document.\n\n` +
+      `మీరు వ్యవసాయ నిపుణుడు. క్రింది సమాచారం వ్యవసాయ పత్రం నుండి తీసుకోబడింది.\n\n` +
       `${contextBlock}\n\n` +
-      `Using ONLY the passages above, answer this question in 2-3 sentences. ` +
-      `Do not ask for more information. If the passages don't contain the answer, say "I don't have that information in my knowledge base."\n\n` +
-      `Respond in the same language as the question.\n` +
-      `Question: ${userQuestion}\n` +
-      `Answer:`;
+      `పై సమాచారాన్ని మాత్రమే ఉపయోగించి 2-3 వాక్యాలలో సమాధానం ఇవ్వండి. ` +
+      `తెలుగులో సమాధానం ఇవ్వండి.\n` +
+      `ప్రశ్న: ${userQuestion}\n` +
+      `సమాధానం:`;
   }
 
   return {

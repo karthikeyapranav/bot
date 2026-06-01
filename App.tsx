@@ -21,7 +21,7 @@ import ProgressBar from './src/components/ProgressBar';
 
 import {loadEmbeddingModel} from './src/api/embeddingModel';
 import {initVectorDB, type RetrievedChunk} from './src/api/vectorDb';
-import {buildRAGPrompt, type RAGDecision} from './src/api/rag';
+import {buildRAGPrompt, type RAGDecision, type LLMCompletionFn} from './src/api/rag';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -38,22 +38,24 @@ type ChatTurn = {
 type Page = 'home' | 'conversation' | 'ragSetup';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants
+// System prompt — Gemma uses <start_of_turn> / <end_of_turn> tags.
+// We hardcode Telugu as the output language.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SYSTEM_CONTENT =
-  'You are an agricultural assistant with expert knowledge about farming, ' +
-  'crops, soil, fertilizers, pests, irrigation, and related topics. ' +
-  'IMPORTANT: Always reply in the same language the user writes in. ' +
-  'If the user writes in Telugu, reply in Telugu. ' +
-  'If the user writes in Kannada, reply in Kannada. ' +
-  'If the user writes in Hindi, reply in Hindi. ' +
-  'If the user writes in English, reply in English. ' +
-  'When retrieved context is provided, use it to answer accurately. ' +
-  'When no context is provided or the topic is not agriculture-related, ' +
-  'answer from your own knowledge. ' +
-  'NEVER ask the user to provide context or text — you already have it. ' +
-  'Keep replies concise (under 200 words).';
+  'మీరు తెలుగు వ్యవసాయ AI సహాయకుడు. ' +
+  'మీకు వ్యవసాయం, పంటలు, నేల, ఎరువులు, తెగుళ్ళు, నీటిపారుదల మరియు ' +
+  'సంబంధిత అంశాలపై నిపుణత ఉంది. ' +
+  'ముఖ్యమైనది: ఎల్లప్పుడూ తెలుగు భాషలో మాత్రమే సమాధానం ఇవ్వాలి. ' +
+  'ఇంగ్లీష్ లేదా ఇతర భాషలు ఉపయోగించకూడదు. ' +
+  'సందర్భం అందించబడినప్పుడు దానిని ఉపయోగించి సమాధానం ఇవ్వండి. ' +
+  'సందర్భం లేనప్పుడు మీ స్వంత జ్ఞానం నుండి సమాధానం ఇవ్వండి. ' +
+  'సమాధానాలు సంక్షిప్తంగా (200 పదాల కంటే తక్కువ) ఉండాలి.';
+
+// Classifier system prompt (English only — for YES/NO answer)
+const CLASSIFIER_SYSTEM =
+  'You are a strict binary topic classifier. ' +
+  'Reply with exactly one word: YES or NO. Nothing else.';
 
 const STOP_WORDS = [
   '<end_of_turn>',
@@ -63,17 +65,21 @@ const STOP_WORDS = [
   '<|endoftext|>',
 ];
 
+// For the fast classifier we use fewer tokens
+const CLASSIFIER_STOP_WORDS = [...STOP_WORDS, '\n', '.', ','];
+
 const MAX_TURNS_IN_CONTEXT = 2;
 
 const DECISION_META: Record<
   RAGDecision,
   {label: string; color: string; bg: string}
 > = {
-  rag_good:      {label: '📄 RAG — good match',         color: '#166534', bg: '#DCFCE7'},
-  rag_weak:      {label: '⚠️ RAG — weak match',          color: '#92400E', bg: '#FEF3C7'},
-  rag_no_chunks: {label: '🔍 Agri question — no chunks', color: '#1E3A5F', bg: '#DBEAFE'},
-  skip_not_agri: {label: '💬 General — LLM only',        color: '#4B1D96', bg: '#EDE9FE'},
+  rag_good:      {label: '📄 RAG — మంచి సరిపోలిక',       color: '#166534', bg: '#DCFCE7'},
+  rag_weak:      {label: '⚠️ RAG — బలహీన సరిపోలిక',       color: '#92400E', bg: '#FEF3C7'},
+  rag_no_chunks: {label: '🔍 వ్యవసాయ ప్రశ్న — chunks లేవు', color: '#1E3A5F', bg: '#DBEAFE'},
+  skip_not_agri: {label: '💬 సాధారణ — LLM మాత్రమే',        color: '#4B1D96', bg: '#EDE9FE'},
 };
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 function App(): React.JSX.Element {
@@ -94,6 +100,9 @@ function App(): React.JSX.Element {
   const [knowledgeChunkCount, setKnowledgeChunkCount] = useState(0);
   const [isIngesting, setIsIngesting]             = useState(false);
 
+  // Shows "classifying…" spinner while LLM decides agri vs non-agri
+  const [isClassifying, setIsClassifying]         = useState(false);
+
   const [currentPage, setCurrentPage]             = useState<Page>('home');
 
   const scrollRef = useRef<ScrollView>(null);
@@ -101,11 +110,9 @@ function App(): React.JSX.Element {
   // ── Mount ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     const setup = async () => {
-      // Check if model already downloaded — if so load it immediately
       const already = await isModelDownloaded();
       if (already) await loadLLM(false);
 
-      // Init vector DB
       try {
         const count = await initVectorDB();
         setKnowledgeChunkCount(count);
@@ -115,7 +122,6 @@ function App(): React.JSX.Element {
         console.warn('VectorDB init failed:', e);
       }
 
-      // Load embedding model
       setEmbeddingLoading(true);
       try {
         await loadEmbeddingModel();
@@ -148,17 +154,13 @@ function App(): React.JSX.Element {
         return false;
       }
 
-      // ── Sanity-check file size before attempting to load ──────────────────
       const stat = await RNFS.stat(destPath);
       if (stat.size < 10_000_000) {
-        // Stale/corrupt file — remove it so the user can re-download cleanly
         await RNFS.unlink(destPath);
         Alert.alert(
           'Corrupt Model File',
-          'The saved model file is too small and is likely corrupt (Google Drive ' +
-            'may have saved a warning page instead of the actual model).\n\n' +
-            'The file has been deleted. Please download again.\n\n' +
-            'Tip: For reliable downloads, host the GGUF on HuggingFace instead.',
+          'The saved model file is too small and is likely corrupt.\n\n' +
+            'The file has been deleted. Please download again.',
         );
         setModelReady(false);
         return false;
@@ -174,22 +176,19 @@ function App(): React.JSX.Element {
         model: destPath,
         use_mlock: true,
         n_ctx: 2048,
-        n_gpu_layers: 0,   // CPU-only — set to 1 only if your device supports Vulkan
+        n_gpu_layers: 0,
         n_batch: 512,
         n_threads: 4,
       });
 
       setLlmContext(ctx);
       setModelReady(true);
-      if (showAlert) Alert.alert('Ready', `${GEMMA_MODEL.displayName} loaded!`);
+      if (showAlert) Alert.alert('సిద్ధం!', `${GEMMA_MODEL.displayName} లోడ్ అయింది!`);
       return true;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error('LLM load error:', msg);
-      Alert.alert(
-        'Load Error',
-        `Could not load model.\n\n${msg}\n\nTry deleting the file and re-downloading.`,
-      );
+      Alert.alert('Load Error', `Could not load model.\n\n${msg}`);
       return false;
     }
   };
@@ -240,7 +239,29 @@ function App(): React.JSX.Element {
     ]);
   };
 
-  // ── Build sliding-window messages ──────────────────────────────────────────
+  // ── LLMCompletionFn ────────────────────────────────────────────────────────
+  // This thin wrapper is passed into buildRAGPrompt so rag.ts can call the
+  // LLM for classification without depending on llama.rn directly.
+  const makeLLMCompleteFn = (ctx: any): LLMCompletionFn =>
+    async (messages) => {
+      let reply = '';
+      await ctx.completion(
+        {
+          messages,
+          n_predict: 8,           // classifier only needs YES / NO (a bit of room)
+          stop: CLASSIFIER_STOP_WORDS,
+          temperature: 0.0,       // deterministic
+          top_p: 1.0,
+          repeat_penalty: 1.0,
+        },
+        (data: {token: string}) => {
+          reply += data.token;
+        },
+      );
+      return reply.trim();
+    };
+
+  // ── Build sliding-window messages (Gemma chat format) ─────────────────────
   const buildLLMMessages = (
     allTurns: ChatTurn[],
     pendingPrompt: string,
@@ -276,11 +297,17 @@ function App(): React.JSX.Element {
 
       if (ragEnabled && chunksLoaded && embeddingReady) {
         try {
-          const ragResult = await buildRAGPrompt(userText);
+          // Show "classifying" indicator while LLM decides agri vs non-agri
+          setIsClassifying(true);
+          const llmCompleteFn = makeLLMCompleteFn(llmContext);
+          const ragResult = await buildRAGPrompt(userText, llmCompleteFn);
+          setIsClassifying(false);
+
           promptContent   = ragResult.prompt;
           retrievedChunks = ragResult.chunks;
           decision        = ragResult.decision;
         } catch (ragErr) {
+          setIsClassifying(false);
           console.warn('RAG failed, falling back to plain question:', ragErr);
         }
       }
@@ -291,7 +318,7 @@ function App(): React.JSX.Element {
       const result = await llmContext.completion(
         {
           messages: llmMessages,
-          n_predict: 512,
+          n_predict: 400,
           stop: STOP_WORDS,
           temperature: 0.7,
           top_p: 0.9,
@@ -309,11 +336,11 @@ function App(): React.JSX.Element {
       setTurns(prev => [
         ...prev,
         {
-          userDisplay:   userText,
-          userPrompt:    promptContent,
+          userDisplay:    userText,
+          userPrompt:     promptContent,
           assistantReply: finalReply,
-          ragChunks:     retrievedChunks,
-          ragDecision:   decision,
+          ragChunks:      retrievedChunks,
+          ragDecision:    decision,
         },
       ]);
       setStreamingText('');
@@ -321,6 +348,7 @@ function App(): React.JSX.Element {
       const msg = error instanceof Error ? error.message : 'Unknown error.';
       Alert.alert('Inference Error', msg);
       setStreamingText('');
+      setIsClassifying(false);
     } finally {
       setIsGenerating(false);
     }
@@ -360,7 +388,7 @@ function App(): React.JSX.Element {
 
           {/* ── Header ──────────────────────────────────────────────────── */}
           <View style={styles.header}>
-            <Text style={styles.headerTitle}>🌾 AgriRAG</Text>
+            <Text style={styles.headerTitle}>🌾 AgriRAG తెలుగు</Text>
             <View style={styles.headerRight}>
               {currentPage === 'conversation' && (
                 <TouchableOpacity
@@ -389,32 +417,32 @@ function App(): React.JSX.Element {
             {embeddingLoading ? (
               <>
                 <ActivityIndicator size="small" color="#fff" style={{marginRight: 8}} />
-                <Text style={styles.statusText}>Loading embedding model…</Text>
+                <Text style={styles.statusText}>Embedding model లోడ్ అవుతోంది…</Text>
               </>
             ) : embeddingReady ? (
               <Text style={styles.statusText}>
-                ✓ Embedding ready
-                {chunksLoaded ? `  |  ✓ ${knowledgeChunkCount} chunks` : '  |  No DB'}
+                ✓ Embedding సిద్ధం
+                {chunksLoaded ? `  |  ✓ ${knowledgeChunkCount} chunks` : '  |  DB లేదు'}
                 {chunksLoaded ? (ragEnabled ? '  |  RAG ON' : '  |  RAG OFF') : ''}
               </Text>
             ) : (
-              <Text style={styles.statusText}>⚠ Embedding failed</Text>
+              <Text style={styles.statusText}>⚠ Embedding విఫలమైంది</Text>
             )}
           </View>
 
           {/* ══════════════════ PAGE: HOME ══════════════════ */}
           {currentPage === 'home' && !isDownloading && (
             <ScrollView contentContainerStyle={styles.scrollContent}>
-              <Text style={styles.pageTitle}>Get Started</Text>
+              <Text style={styles.pageTitle}>ప్రారంభించండి</Text>
 
               <View style={styles.card}>
                 <Text style={styles.sectionLabel}>Model</Text>
                 <Text style={styles.modelName}>{GEMMA_MODEL.displayName}</Text>
                 <Text style={styles.modelMeta}>
-                  Quantization: Q2_K  ·  {GEMMA_MODEL.sizeHint}
+                  Quantization: Q4_K_S  ·  {GEMMA_MODEL.sizeHint}
                 </Text>
                 <Text style={[styles.hintText, {marginTop: 6}]}>
-                  Your custom quantized Gemma 3 1B model.
+                  తెలుగు భాషలో వ్యవసాయ సహాయం అందించే Gemma 3 1B మోడల్.
                 </Text>
 
                 {modelReady ? (
@@ -422,12 +450,12 @@ function App(): React.JSX.Element {
                     <TouchableOpacity
                       style={styles.primaryBtn}
                       onPress={() => setCurrentPage('conversation')}>
-                      <Text style={styles.primaryBtnText}>Open Chat →</Text>
+                      <Text style={styles.primaryBtnText}>Chat తెరవండి →</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={styles.dangerBtn}
                       onPress={handleDeleteModel}>
-                      <Text style={styles.dangerBtnText}>Delete Model File</Text>
+                      <Text style={styles.dangerBtnText}>Model File తొలగించండి</Text>
                     </TouchableOpacity>
                   </View>
                 ) : (
@@ -442,12 +470,13 @@ function App(): React.JSX.Element {
               </View>
 
               <View style={styles.card}>
-                <Text style={styles.sectionLabel}>Smart RAG Logic</Text>
+                <Text style={styles.sectionLabel}>Smart RAG Logic (LLM నిర్ణయిస్తుంది)</Text>
                 <Text style={styles.hintText}>
-                  {'🌾 Agriculture question + good chunks → RAG answer\n'}
-                  {'⚠️  Agriculture question + weak chunks → RAG + LLM combined\n'}
-                  {'🔍 Agriculture + no chunks → LLM answers itself\n'}
-                  {'💬 Non-agriculture question → LLM answers directly (no RAG)'}
+                  {'🤖 మీ ప్రశ్న → LLM వ్యవసాయమా కాదా అని నిర్ణయిస్తుంది\n'}
+                  {'🌾 వ్యవసాయ + మంచి chunks → RAG సమాధానం\n'}
+                  {'⚠️  వ్యవసాయ + బలహీన chunks → RAG + LLM కలిపి\n'}
+                  {'🔍 వ్యవసాయ + chunks లేవు → LLM స్వయంగా సమాధానం\n'}
+                  {'💬 వ్యవసాయం కాదు → LLM మాత్రమే (RAG లేదు)'}
                 </Text>
               </View>
 
@@ -457,7 +486,7 @@ function App(): React.JSX.Element {
                   {'Question      →  128 tokens\n'}
                   {'3 chunks×150  →  ~450 tokens\n'}
                   {'LLM reply     →  ~300 tokens\n'}
-                  {'Overhead      →  ~120 tokens\n'}
+                  {'Classifier    →  ~50 tokens\n'}
                   {'─────────────────────────────\n'}
                   {`Per turn ≈ 1 000 tokens\n`}
                   {`${MAX_TURNS_IN_CONTEXT} turns kept in context ≈ 2 000 tokens (n_ctx=2048)`}
@@ -469,13 +498,13 @@ function App(): React.JSX.Element {
           {/* ══════════════════ PAGE: DOWNLOADING ══════════════════ */}
           {isDownloading && (
             <View style={styles.centeredCard}>
-              <Text style={styles.sectionLabel}>Downloading</Text>
+              <Text style={styles.sectionLabel}>డౌన్లోడ్ అవుతోంది</Text>
               <Text style={styles.modelName}>{GEMMA_MODEL.displayName}</Text>
               <Text style={styles.modelMeta}>{GEMMA_MODEL.sizeHint}</Text>
               <ProgressBar progress={downloadProgress / 100} />
               <Text style={styles.progressPct}>{downloadProgress}%</Text>
               <Text style={[styles.hintText, {textAlign: 'center', marginTop: 12}]}>
-                If this gets stuck at 100% or fails, the model URL may need updating.
+                100% వద్ద ఆగిపోతే, model URL మార్చాల్సి ఉండవచ్చు.
               </Text>
             </View>
           )}
@@ -501,7 +530,7 @@ function App(): React.JSX.Element {
                 </TouchableOpacity>
                 {!chunksLoaded && (
                   <Text style={styles.hintText}>
-                    Load the bundled knowledge DB below to enable RAG.
+                    Knowledge DB లోడ్ చేయండి.
                   </Text>
                 )}
               </View>
@@ -509,15 +538,15 @@ function App(): React.JSX.Element {
               <View style={styles.card}>
                 <Text style={styles.sectionLabel}>Knowledge Database</Text>
                 <Text style={styles.hintText}>
-                  {'Bundled: knowledge.db (read-only, built in Python)\n'}
+                  {'Bundled: knowledge.db (Python లో నిర్మించబడింది)\n'}
                   {knowledgeChunkCount
                     ? `Chunks: ${knowledgeChunkCount}`
-                    : 'No chunks loaded yet.'}
+                    : 'ఇంకా chunks లోడ్ కాలేదు.'}
                 </Text>
                 {isIngesting ? (
                   <View style={styles.ingestProgress}>
                     <ActivityIndicator size="small" color={BLUE} />
-                    <Text style={styles.ingestProgressText}>Loading…</Text>
+                    <Text style={styles.ingestProgressText}>లోడ్ అవుతోంది…</Text>
                   </View>
                 ) : (
                   <TouchableOpacity
@@ -528,7 +557,7 @@ function App(): React.JSX.Element {
                     ]}
                     disabled={!embeddingReady}
                     onPress={handleReloadDB}>
-                    <Text style={styles.primaryBtnText}>Reload Knowledge DB</Text>
+                    <Text style={styles.primaryBtnText}>Knowledge DB రీలోడ్</Text>
                   </TouchableOpacity>
                 )}
               </View>
@@ -545,7 +574,9 @@ function App(): React.JSX.Element {
 
                 {ragEnabled && chunksLoaded && (
                   <View style={styles.ragBadge}>
-                    <Text style={styles.ragBadgeText}>🌾 Smart RAG active</Text>
+                    <Text style={styles.ragBadgeText}>
+                      🌾 Smart RAG active · LLM నిర్ణయం
+                    </Text>
                   </View>
                 )}
 
@@ -554,7 +585,7 @@ function App(): React.JSX.Element {
                     <Text style={styles.windowBannerText}>
                       Context: {turnsInWindow}/{MAX_TURNS_IN_CONTEXT} turns
                       {turnsDropped > 0
-                        ? `  ·  ${turnsDropped} turn${turnsDropped > 1 ? 's' : ''} dropped`
+                        ? `  ·  ${turnsDropped} turn${turnsDropped > 1 ? 's' : ''} తీసివేయబడ్డాయి`
                         : ''}
                     </Text>
                   </View>
@@ -563,7 +594,7 @@ function App(): React.JSX.Element {
                 {!llmContext && (
                   <View style={styles.emptyState}>
                     <Text style={styles.emptyStateText}>
-                      Go to Home to download the model first.
+                      ముందుగా Home లో model డౌన్లోడ్ చేయండి.
                     </Text>
                   </View>
                 )}
@@ -576,7 +607,7 @@ function App(): React.JSX.Element {
                     <View key={idx}>
                       {isOutside && (
                         <Text style={styles.outsideWindowLabel}>
-                          ↑ Outside LLM context
+                          ↑ LLM context బయట
                         </Text>
                       )}
 
@@ -632,7 +663,7 @@ function App(): React.JSX.Element {
                         styles.bubbleWrapperAssistant,
                         isOutside && styles.fadedOpacity,
                       ]}>
-                        <Text style={styles.roleLabel}>🌾 Gemma</Text>
+                        <Text style={styles.roleLabel}>🌾 Gemma తెలుగు</Text>
                         <View style={[styles.bubble, styles.bubbleAssistant]}>
                           <Text style={styles.bubbleText}>{turn.assistantReply}</Text>
                         </View>
@@ -641,10 +672,23 @@ function App(): React.JSX.Element {
                   );
                 })}
 
-                {/* Streaming bubble */}
-                {isGenerating && (
+                {/* Classifying spinner (shown before streaming starts) */}
+                {isClassifying && !streamingText && (
                   <View style={[styles.bubbleWrapper, styles.bubbleWrapperAssistant]}>
-                    <Text style={styles.roleLabel}>🌾 Gemma</Text>
+                    <Text style={styles.roleLabel}>🤖 వర్గీకరిస్తోంది…</Text>
+                    <View style={[styles.bubble, styles.bubbleAssistant, styles.classifyingBubble]}>
+                      <ActivityIndicator size="small" color={BLUE} />
+                      <Text style={styles.classifyingText}>
+                        ప్రశ్న విశ్లేషిస్తోంది…
+                      </Text>
+                    </View>
+                  </View>
+                )}
+
+                {/* Streaming bubble */}
+                {isGenerating && !isClassifying && (
+                  <View style={[styles.bubbleWrapper, styles.bubbleWrapperAssistant]}>
+                    <Text style={styles.roleLabel}>🌾 Gemma తెలుగు</Text>
                     <View style={[styles.bubble, styles.bubbleAssistant]}>
                       {streamingText ? (
                         <Text style={styles.bubbleText}>{streamingText}</Text>
@@ -675,9 +719,9 @@ function App(): React.JSX.Element {
                   placeholder={
                     llmContext
                       ? ragEnabled
-                        ? 'Ask about crops, soil, pests…'
-                        : 'Type a message…'
-                      : 'Load model first…'
+                        ? 'పంటలు, నేల, తెగుళ్ళ గురించి అడగండి…'
+                        : 'సందేశం టైప్ చేయండి…'
+                      : 'ముందుగా model లోడ్ చేయండి…'
                   }
                   placeholderTextColor="#94A3B8"
                   value={userInput}
@@ -844,6 +888,10 @@ const styles = StyleSheet.create({
   },
   bubbleText:     {fontSize: 15, color: TEXT_MAIN, lineHeight: 22},
   bubbleTextUser: {color: '#FFFFFF'},
+
+  // Classifying indicator bubble
+  classifyingBubble: {flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 10},
+  classifyingText:   {fontSize: 13, color: TEXT_MUTED, fontStyle: 'italic'},
 
   decisionBadge: {
     alignSelf: 'flex-end', marginTop: 4, marginRight: 4,
